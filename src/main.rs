@@ -128,6 +128,7 @@ async fn main() -> Result<()> {
     if cli.resume && cli.checkpoint.is_none() {
         bail!("--resume 需要配合 --checkpoint <路径> 使用");
     }
+    let use_binlog = cli.cdc && cli.cdc_mode == "binlog";
 
     let src_dialect = Dialect::detect(&cli.source)?;
     let dst_dialect = Dialect::detect(&cli.target)?;
@@ -193,6 +194,15 @@ async fn main() -> Result<()> {
     }
     println!("共 {} 张表", tables.len());
 
+    // MySQL 没有 PG 的导出快照能力，各并行任务各自开一致性事务，跨表时点可能不同
+    if src_dialect == Dialect::Mysql && cli.parallel > 1 && tables.len() > 1 && !use_binlog {
+        eprintln!(
+            "  警告：MySQL 源不支持跨表一致性快照，--parallel {} 时各表读取时点可能不同。",
+            cli.parallel
+        );
+        eprintln!("        需要严格一致请用 --parallel 1，或改用 --cdc --cdc-mode binlog 在全量后追平。");
+    }
+
     if cli.dry_run {
         print_ddl(src_dialect, dst_dialect, &dst_ns, &tables);
         println!("-- 数据搬运计划（每批 {} 行，并行 {}）：", cli.batch_size, cli.parallel);
@@ -222,10 +232,20 @@ async fn main() -> Result<()> {
         // 目标被清空后必须重新全搬，binlog 位点也重新取
         checkpoint.binlog = None;
     }
+    // 轮询水位也必须在全量之前记录：若等全量结束再取 max，
+    // 全量期间发生的更新会落在该 max 之前，增量阶段用 > 比较就再也扫不到。
+    if cli.cdc && !use_binlog {
+        let opts = cdc::CdcOptions {
+            interval_secs: cli.cdc_interval,
+            column: cli.cdc_column.clone(),
+            batch_size: cli.batch_size,
+        };
+        cdc::prime_watermarks(&src_ep, &tables, &opts, &mut checkpoint, cli.checkpoint.as_deref())
+            .await?;
+    }
     let checkpoint = Arc::new(Mutex::new(checkpoint));
 
     // binlog 增量同步：在开始搬数据之前记下位点，之后才能补上迁移期间的变更
-    let use_binlog = cli.cdc && cli.cdc_mode == "binlog";
     if use_binlog {
         binlog_cdc::ensure_supported(&src_ep)?;
         if checkpoint.lock().unwrap().binlog.is_none() {

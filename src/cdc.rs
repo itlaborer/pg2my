@@ -38,6 +38,38 @@ fn watermark_column(table: &Table, explicit: Option<&str>) -> Option<String> {
     table.primary_key.first().cloned()
 }
 
+/// 全量搬运之前记录每个表的水位起点。
+///
+/// 必须早于全量开始：如果在全量结束后才取 `max(水位列)`，全量期间发生的更新
+/// 时间戳会小于该最大值，增量阶段用 `>` 比较就永远扫不到。提前记录后，
+/// 全量期间的变化都大于起点，会在第一轮增量里被补上（重复行由 upsert 吸收）。
+pub async fn prime_watermarks(
+    src_ep: &Endpoint,
+    tables: &[Table],
+    opts: &CdcOptions,
+    checkpoint: &mut Checkpoint,
+    checkpoint_path: Option<&Path>,
+) -> Result<()> {
+    let mut src = Source::connect(src_ep).await?;
+    for table in tables {
+        let Some(col) = watermark_column(table, opts.column.as_deref()) else {
+            continue;
+        };
+        // 没有主键就无法 upsert，和正式增量阶段保持一致直接跳过
+        if table.primary_key.is_empty() || checkpoint.watermark(&table.name).is_some() {
+            continue;
+        }
+        if let Some(max) = src.max_text(table, &col).await? {
+            checkpoint.set_watermark(&table.name, &max);
+            println!("  增量起点 {:<28} {} = {}", table.name, col, max);
+        }
+    }
+    if let Some(path) = checkpoint_path {
+        checkpoint.save(path)?;
+    }
+    Ok(())
+}
+
 pub async fn run(
     src_ep: &Endpoint,
     dst_ep: &Endpoint,

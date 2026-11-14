@@ -10,6 +10,8 @@ use crate::model::{Dialect, Table, Value};
 pub struct MyTarget {
     pub conn: Conn,
     pub db: String,
+    /// MySQL 8.0.19+ 支持 `AS new` 别名；MariaDB 与 5.7 仍只支持 VALUES()
+    upsert_alias: bool,
 }
 
 pub async fn connect(url: &str, db: &str) -> Result<MyTarget> {
@@ -32,7 +34,25 @@ pub async fn connect(url: &str, db: &str) -> Result<MyTarget> {
     conn.query_drop("SET SESSION sql_mode = CONCAT(@@sql_mode, ',NO_AUTO_VALUE_ON_ZERO')")
         .await
         .context("设置 MySQL sql_mode 失败")?;
-    Ok(MyTarget { conn, db: db.to_string() })
+    let version: Option<String> = conn
+        .query_first("SELECT VERSION()")
+        .await
+        .context("读取 MySQL 版本失败")?;
+    let upsert_alias = supports_upsert_alias(version.as_deref().unwrap_or(""));
+    Ok(MyTarget { conn, db: db.to_string(), upsert_alias })
+}
+
+/// `INSERT ... AS new ON DUPLICATE KEY UPDATE` 从 MySQL 8.0.19 开始支持，
+/// MariaDB 至今不支持，误用会直接语法错误，所以要按版本分流。
+fn supports_upsert_alias(version: &str) -> bool {
+    if version.to_ascii_lowercase().contains("mariadb") {
+        return false;
+    }
+    let mut parts = version.split(['.', '-']);
+    let major: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let minor: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let patch: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    (major, minor, patch) >= (8, 0, 19)
 }
 
 pub async fn exec(target: &mut MyTarget, sql: &str) -> Result<()> {
@@ -126,13 +146,21 @@ async fn write_chunk(
         Dialect::Mysql.qualified(&target.db, &table.name)
     );
     if upsert {
+        // 别名必须紧跟 VALUES 列表，再写 ON DUPLICATE KEY UPDATE
+        if target.upsert_alias {
+            sql.push_str(" AS new");
+        }
         let updates = table
             .columns
             .iter()
             .filter(|c| !table.primary_key.contains(&c.name))
             .map(|c| {
                 let q = Dialect::Mysql.quote(&c.name);
-                format!("{q} = VALUES({q})")
+                if target.upsert_alias {
+                    format!("{q} = new.{q}")
+                } else {
+                    format!("{q} = VALUES({q})")
+                }
             })
             .collect::<Vec<_>>();
         if updates.is_empty() {
@@ -233,4 +261,23 @@ pub async fn delete_by_pk(target: &mut MyTarget, table: &Table, pk: &[Value]) ->
         .await
         .with_context(|| format!("按主键删除 {} 失败", table.name))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::supports_upsert_alias;
+
+    #[test]
+    fn mysql8_uses_alias() {
+        assert!(supports_upsert_alias("8.0.19"));
+        assert!(supports_upsert_alias("8.0.36-0ubuntu0.22.04.1"));
+        assert!(supports_upsert_alias("8.4.2"));
+    }
+
+    #[test]
+    fn mariadb_and_old_mysql_keep_values() {
+        assert!(!supports_upsert_alias("10.5.29-MariaDB"));
+        assert!(!supports_upsert_alias("5.7.44-log"));
+        assert!(!supports_upsert_alias("8.0.18"));
+    }
 }

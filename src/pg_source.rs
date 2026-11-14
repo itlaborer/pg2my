@@ -368,10 +368,22 @@ pub async fn count(src: &PgSource, table: &Table) -> Result<i64> {
 }
 
 /// 取水位列当前最大值，用于初始化增量同步位点。
+/// 时间类列按与查询相同的微秒精度格式化，否则 "…:00" 与 "…:00.000000"
+/// 在文本比较下不相等，会让边界行每轮被重复读取。
 pub async fn max_text(src: &PgSource, table: &Table, column: &str) -> Result<Option<String>> {
+    let c = Dialect::Postgres.quote(column);
+    let kind = table.columns.iter().find(|col| col.name == column).map(|col| &col.kind);
+    let expr = match kind {
+        Some(ColumnKind::TimestampTz) => {
+            format!("to_char(max({c}) AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US')")
+        }
+        Some(ColumnKind::Timestamp) => format!("to_char(max({c}), 'YYYY-MM-DD HH24:MI:SS.US')"),
+        Some(ColumnKind::Date) => format!("to_char(max({c}), 'YYYY-MM-DD')"),
+        Some(ColumnKind::Time) => format!("to_char(max({c}), 'HH24:MI:SS.US')"),
+        _ => format!("max({c})::text"),
+    };
     let sql = format!(
-        "SELECT max({})::text FROM {}",
-        Dialect::Postgres.quote(column),
+        "SELECT {expr} FROM {}",
         Dialect::Postgres.qualified(&src.ns, &table.name)
     );
     let row = src.client.query_one(&sql, &[]).await.context("读取水位最大值失败")?;

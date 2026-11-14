@@ -108,6 +108,20 @@ impl Sink {
         }
     }
 
+    /// 开启目标事务：binlog 按事务聚合后整体提交，保证目标端不会出现半个事务。
+    pub async fn begin(&mut self) -> Result<()> {
+        self.exec("BEGIN").await
+    }
+
+    pub async fn commit(&mut self) -> Result<()> {
+        self.exec("COMMIT").await
+    }
+
+    /// 回滚失败不再上抛，真正的错误由调用方保留。
+    pub async fn rollback(&mut self) {
+        let _ = self.exec("ROLLBACK").await;
+    }
+
     pub async fn write_batch(
         &mut self,
         table: &Table,
@@ -134,12 +148,17 @@ impl Sink {
     }
 }
 
-/// 只重试死锁与锁等待超时，其它错误直接失败。
+/// 只重试死锁、序列化失败、锁等待超时，按数据库返回的错误码判断，避免依赖错误文本。
 fn retryable(e: &anyhow::Error) -> bool {
-    let text = format!("{e:#}").to_ascii_lowercase();
-    text.contains("deadlock detected")
-        || text.contains("deadlock found")
-        || text.contains("could not serialize access")
-        || text.contains("lock wait timeout")
-        || text.contains("error 1213")
+    // PG：40P01=死锁，40001=序列化失败，55P03=锁不可用
+    if let Some(err) = e.downcast_ref::<tokio_postgres::Error>() {
+        return err
+            .as_db_error()
+            .is_some_and(|db| matches!(db.code().code(), "40P01" | "40001" | "55P03"));
+    }
+    // MySQL：1213=死锁，1205=锁等待超时
+    if let Some(mysql_async::Error::Server(err)) = e.downcast_ref::<mysql_async::Error>() {
+        return matches!(err.code, 1213 | 1205);
+    }
+    false
 }

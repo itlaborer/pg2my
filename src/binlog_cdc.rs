@@ -60,8 +60,12 @@ pub async fn run(
     }
 
     let mut sink = Sink::connect(dst_ep).await?;
-    let index: HashMap<String, Table> =
-        tables.iter().map(|t| (t.name.clone(), t.clone())).collect();
+    // 只存下标，避免每行都克隆一份 Table
+    let index: HashMap<String, usize> = tables
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.name.clone(), i))
+        .collect();
 
     println!(
         "\n进入 binlog 增量同步：{}:{}，Ctrl-C 退出",
@@ -71,23 +75,58 @@ pub async fn run(
     let mut file = start.file;
     let mut pos = start.pos;
     let mut last_save = Instant::now();
+    // 断流重连的退避时间，成功建流后重置
+    let mut backoff = Duration::from_secs(1);
 
     loop {
-        let conn = Conn::new(Opts::from_url(&src_ep.url).context("MySQL 连接串格式不对")?)
-            .await
-            .context("连接源 MySQL 失败")?;
+        let conn = match Conn::new(
+            Opts::from_url(&src_ep.url).context("MySQL 连接串格式不对")?,
+        )
+        .await
+        {
+            Ok(conn) => conn,
+            Err(e) => {
+                let err = anyhow::Error::new(e);
+                // 认证/权限错误重试没有意义，直接退出
+                if matches!(server_code(&err), Some(1044 | 1045 | 1251)) {
+                    return Err(err.context("连接源 MySQL 失败"));
+                }
+                eprintln!("  连接源 MySQL 失败：{err:#}，{}s 后重试", backoff.as_secs());
+                tokio::time::sleep(backoff).await;
+                backoff = next_backoff(backoff);
+                continue;
+            }
+        };
         let request = BinlogStreamRequest::new(server_id)
             .with_filename(file.as_bytes())
             .with_pos(pos);
-        let stream = conn
-            .get_binlog_stream(request)
-            .await
-            .context("订阅 binlog 失败（需要 REPLICATION SLAVE 权限）")?;
+        let stream = match conn.get_binlog_stream(request).await {
+            Ok(stream) => stream,
+            Err(e) => {
+                let err = anyhow::Error::new(e);
+                if server_code(&err) == Some(1236) {
+                    bail!(
+                        "binlog 位点 {}:{} 已失效（错误 1236，日志可能已被清理），\
+                         请重新执行一次全量迁移后再启动增量同步",
+                        file,
+                        pos
+                    );
+                }
+                eprintln!("  订阅 binlog 失败：{err:#}，{}s 后重试", backoff.as_secs());
+                tokio::time::sleep(backoff).await;
+                backoff = next_backoff(backoff);
+                continue;
+            }
+        };
         pin_mut!(stream);
+        backoff = Duration::from_secs(1);
+        // 一个事务的行事件先攒起来，收到 XID 再整体提交
+        let mut pending: Vec<BinlogOp> = Vec::new();
 
         loop {
             let next = tokio::select! {
                 _ = tokio::signal::ctrl_c() => {
+                    // 未提交的事务直接丢弃，位点仍停在上一个 XID，重启后会重放
                     checkpoint.binlog = Some(BinlogPos { file: file.clone(), pos });
                     if let Some(path) = checkpoint_path {
                         checkpoint.save(path)?;
@@ -101,10 +140,27 @@ pub async fn run(
                 // 源库轮转或重启导致流结束，保存位点后重连
                 break;
             };
-            let event = event.context("读取 binlog 失败")?;
+            let event = match event {
+                Ok(event) => event,
+                Err(e) => {
+                    let err = anyhow::Error::new(e);
+                    if server_code(&err) == Some(1236) {
+                        bail!(
+                            "binlog 位点 {}:{} 已失效（错误 1236，日志可能已被清理），\
+                             请重新执行一次全量迁移后再启动增量同步",
+                            file,
+                            pos
+                        );
+                    }
+                    eprintln!("  读取 binlog 中断：{err:#}，准备重连");
+                    break;
+                }
+            };
             let log_pos = event.header().log_pos() as u64;
             match event.read_data().context("解析 binlog 事件失败")? {
                 Some(EventData::RotateEvent(ev)) => {
+                    // 轮转前若还有未提交事件，先按当前事务落库
+                    flush_transaction(&mut sink, tables, &mut pending).await?;
                     // MariaDB 的 rotate 事件可能带校验和尾巴，文件名只取合法字符
                     file = clean_binlog_name(&ev.name());
                     // header.log_pos 为 0 的是建流时的 fake rotate，不能用它的 position 覆盖进度
@@ -121,13 +177,14 @@ pub async fn run(
                         continue;
                     }
                     let name = tme.table_name().to_string();
-                    let Some(table) = index.get(&name) else {
+                    let Some(&idx) = index.get(&name) else {
                         continue;
                     };
-                    apply_rows(&ev, tme, table, &mut sink).await?;
+                    collect_rows(&ev, tme, idx, &tables[idx], &mut pending)?;
                 }
                 Some(EventData::XidEvent(_)) => {
-                    // 事务提交，位点可以安全前移
+                    // 事务提交：整体写入目标，再推进位点，保证至少一次
+                    flush_transaction(&mut sink, tables, &mut pending).await?;
                     pos = log_pos;
                 }
                 _ => {}
@@ -145,16 +202,36 @@ pub async fn run(
         if let Some(path) = checkpoint_path {
             checkpoint.save(path)?;
         }
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(backoff).await;
     }
 }
 
-/// 按事件类型应用 INSERT / UPDATE / DELETE。
-async fn apply_rows(
+/// 退避时间翻倍，最多 30 秒。
+fn next_backoff(current: Duration) -> Duration {
+    (current * 2).min(Duration::from_secs(30))
+}
+
+/// 取出 mysql_async 服务端错误码，用于识别重试与 fatal 场景。
+fn server_code(e: &anyhow::Error) -> Option<u16> {
+    match e.downcast_ref::<mysql_async::Error>() {
+        Some(mysql_async::Error::Server(err)) => Some(err.code),
+        _ => None,
+    }
+}
+
+/// 一个事务内待落库的操作；收到 XID 后整体提交。
+enum BinlogOp {
+    Upsert(usize, Vec<Value>),
+    Delete(usize, Vec<Value>),
+}
+
+/// 把行事件按主键变化展开成有序操作，暂不落库。
+fn collect_rows(
     ev: &RowsEventData<'_>,
     tme: &TableMapEvent<'_>,
+    table_idx: usize,
     table: &Table,
-    sink: &mut Sink,
+    ops: &mut Vec<BinlogOp>,
 ) -> Result<()> {
     if ev.num_columns() as usize != table.columns.len() {
         eprintln!(
@@ -185,13 +262,13 @@ async fn apply_rows(
                 }
                 if let Some(b) = &before {
                     let pk = pk_values(table, b)?;
-                    sink.delete_by_pk(table, &pk).await?;
+                    ops.push(BinlogOp::Delete(table_idx, pk));
                 }
             }
             "insert" => {
                 if let Some(a) = &after {
                     let values = full_values(table, a)?;
-                    sink.write_batch(table, &[values], true).await?;
+                    ops.push(BinlogOp::Upsert(table_idx, values));
                 }
             }
             _ => {
@@ -210,10 +287,56 @@ async fn apply_rows(
                 };
                 // 主键被更新时，先把旧行删掉，避免目标库留一条幽灵行
                 if !old_pk.is_empty() && old_pk != new_pk {
-                    sink.delete_by_pk(table, &old_pk).await?;
+                    ops.push(BinlogOp::Delete(table_idx, old_pk));
                 }
                 let values = full_values(table, a)?;
-                sink.write_batch(table, &[values], true).await?;
+                ops.push(BinlogOp::Upsert(table_idx, values));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 一个事务整体落库：BEGIN → 逐表批量写 → COMMIT，失败回滚。
+async fn flush_transaction(
+    sink: &mut Sink,
+    tables: &[Table],
+    ops: &mut Vec<BinlogOp>,
+) -> Result<()> {
+    if ops.is_empty() {
+        return Ok(());
+    }
+    let batch = std::mem::take(ops);
+    sink.begin().await?;
+    if let Err(e) = apply_ops(sink, tables, batch).await {
+        sink.rollback().await;
+        return Err(e);
+    }
+    if let Err(e) = sink.commit().await {
+        sink.rollback().await;
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// 按表的连续段落合并成多行写入，减少往返；删除保持逐行。
+async fn apply_ops(sink: &mut Sink, tables: &[Table], ops: Vec<BinlogOp>) -> Result<()> {
+    let mut iter = ops.into_iter().peekable();
+    while let Some(op) = iter.next() {
+        match op {
+            BinlogOp::Delete(idx, pk) => sink.delete_by_pk(&tables[idx], &pk).await?,
+            BinlogOp::Upsert(idx, first) => {
+                let mut rows = vec![first];
+                while let Some(BinlogOp::Upsert(next_idx, _)) = iter.peek() {
+                    if *next_idx != idx {
+                        break;
+                    }
+                    match iter.next() {
+                        Some(BinlogOp::Upsert(_, values)) => rows.push(values),
+                        _ => break,
+                    }
+                }
+                sink.write_batch(&tables[idx], &rows, true).await?;
             }
         }
     }
