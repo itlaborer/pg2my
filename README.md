@@ -1,5 +1,7 @@
 # pg2mysql
 
+[![CI](https://github.com/itlaborer/pg2my/actions/workflows/ci.yml/badge.svg)](https://github.com/itlaborer/pg2my/actions/workflows/ci.yml)
+
 一个用 Rust 写的多方言数据库迁移工具，支持 **PostgreSQL → PostgreSQL**、**MySQL → MySQL**、**PostgreSQL → MySQL**、**MySQL → PostgreSQL** 四种方向。结构与数据一起搬，适合整库迁移、指定表同步和大表续搬。
 
 ## 特性
@@ -36,6 +38,24 @@ cargo build --release --target x86_64-unknown-linux-musl
 ```
 
 ARM64 把 target 换成 `aarch64-unknown-linux-musl` 即可。
+
+## 测试
+
+```bash
+cargo test --bins          # 单元测试：类型映射、DDL 生成、默认值翻译等
+cargo clippy --all-targets -- -D warnings
+cargo fmt --all -- --check
+```
+
+集成测试会真实跑四种迁移方向，需要两个可建库的连接串，未设置则自动跳过：
+
+```bash
+PG2MYSQL_IT_PG_URL=postgres://postgres@127.0.0.1:5432/postgres \
+PG2MYSQL_IT_MYSQL_URL=mysql://root@127.0.0.1:3306/ \
+cargo test --test integration -- --nocapture
+```
+
+GitHub Actions 的 `integration` job 用 `postgres:13` + `mariadb:10.5` 服务容器运行同一套用例。
 
 ## 快速开始
 

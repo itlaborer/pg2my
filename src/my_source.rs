@@ -3,9 +3,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
-use mysql_async::{
-    Conn, Opts, Params, Row, Value as MyValue, prelude::Queryable,
-};
+use mysql_async::{Conn, Opts, Params, Row, Value as MyValue, prelude::Queryable};
 
 use crate::model::{
     Column, ColumnKind, CopyStat, Dialect, ForeignKey, IncrementalFilter, Index, RowResume, Table,
@@ -29,7 +27,10 @@ pub async fn connect(url: &str, ns: &str) -> Result<MySource> {
     conn.query_drop("SET SESSION time_zone = '+00:00'")
         .await
         .context("设置 MySQL 会话时区失败")?;
-    Ok(MySource { conn, ns: ns.to_string() })
+    Ok(MySource {
+        conn,
+        ns: ns.to_string(),
+    })
 }
 
 /// 搬运专用连接：开一个一致性快照事务，避免单表读到不同时间点的数据。
@@ -79,7 +80,10 @@ ORDER BY k.CONSTRAINT_NAME, k.ORDINAL_POSITION
 "#;
 
 fn params2(a: &str, b: &str) -> Params {
-    Params::Positional(vec![MyValue::from(a.to_string()), MyValue::from(b.to_string())])
+    Params::Positional(vec![
+        MyValue::from(a.to_string()),
+        MyValue::from(b.to_string()),
+    ])
 }
 
 /// MariaDB 的 JSON 实际是 longtext + CHECK(json_valid(`列`))，靠约束反推。
@@ -95,7 +99,10 @@ WHERE cc.CONSTRAINT_SCHEMA = ? AND tc.TABLE_NAME = ?
 pub async fn introspect(src: &mut MySource, filter: Option<&[String]>) -> Result<Vec<Table>> {
     let rows: Vec<Row> = src
         .conn
-        .exec(TABLES_SQL, Params::Positional(vec![MyValue::from(src.ns.clone())]))
+        .exec(
+            TABLES_SQL,
+            Params::Positional(vec![MyValue::from(src.ns.clone())]),
+        )
         .await
         .context("读取 MySQL 表列表失败")?;
 
@@ -105,9 +112,7 @@ pub async fn introspect(src: &mut MySource, filter: Option<&[String]>) -> Result
         if filter.is_some_and(|f| !f.contains(&name)) {
             continue;
         }
-        let table_comment = row
-            .get::<String, _>(1)
-            .filter(|c| !c.is_empty());
+        let table_comment = row.get::<String, _>(1).filter(|c| !c.is_empty());
 
         let col_rows: Vec<Row> = src
             .conn
@@ -137,7 +142,8 @@ pub async fn introspect(src: &mut MySource, filter: Option<&[String]>) -> Result
             let extra = r.get::<String, _>(5).unwrap_or_default();
             // 生成列不能显式写入，直接跳过
             let extra_lower = extra.to_ascii_lowercase();
-            if extra_lower.contains("virtual generated") || extra_lower.contains("stored generated") {
+            if extra_lower.contains("virtual generated") || extra_lower.contains("stored generated")
+            {
                 eprintln!("  跳过 {name}.{col_name}：生成列不参与迁移");
                 continue;
             }
@@ -146,27 +152,19 @@ pub async fn introspect(src: &mut MySource, filter: Option<&[String]>) -> Result
             let precision = r.get::<MyValue, _>(8).and_then(|v| value_u64(&v));
             let scale = r.get::<MyValue, _>(9).and_then(|v| value_u64(&v));
 
-            let kind = type_map::parse_mysql(
-                &data_type,
-                &column_type,
-                char_len,
-                precision,
-                scale,
-            );
+            let kind = type_map::parse_mysql(&data_type, &column_type, char_len, precision, scale);
             // MariaDB：longtext + CHECK(json_valid(`col`)) 等价于 JSON 列
             let kind = if matches!(kind, ColumnKind::Text { .. })
                 && json_checks.iter().any(|c| {
-                    c.contains("json_valid(") && c.contains(&format!("`{}`", col_name.to_lowercase()))
-                })
-            {
+                    c.contains("json_valid(")
+                        && c.contains(&format!("`{}`", col_name.to_lowercase()))
+                }) {
                 ColumnKind::Json
             } else {
                 kind
             };
             if matches!(kind, ColumnKind::Other { .. }) {
-                eprintln!(
-                    "  警告 {name}.{col_name}：类型 {column_type} 没有对应映射，按文本搬运"
-                );
+                eprintln!("  警告 {name}.{col_name}：类型 {column_type} 没有对应映射，按文本搬运");
             }
             columns.push(Column {
                 name: col_name,
@@ -191,7 +189,10 @@ pub async fn introspect(src: &mut MySource, filter: Option<&[String]>) -> Result
         let mut order: Vec<String> = Vec::new();
         for r in idx_rows {
             let idx_name = r.get::<String, _>(0).unwrap_or_default();
-            let non_unique = r.get::<MyValue, _>(1).and_then(|v| value_u64(&v)).unwrap_or(1);
+            let non_unique = r
+                .get::<MyValue, _>(1)
+                .and_then(|v| value_u64(&v))
+                .unwrap_or(1);
             let Some(col) = r.get::<String, _>(2) else {
                 continue;
             };
@@ -202,12 +203,18 @@ pub async fn introspect(src: &mut MySource, filter: Option<&[String]>) -> Result
             if !idx_map.contains_key(&idx_name) {
                 order.push(idx_name.clone());
             }
-            let entry = idx_map.entry(idx_name).or_insert((non_unique == 0, Vec::new()));
+            let entry = idx_map
+                .entry(idx_name)
+                .or_insert((non_unique == 0, Vec::new()));
             entry.1.push(col);
         }
         for idx_name in order {
             if let Some((unique, cols)) = idx_map.remove(&idx_name) {
-                indexes.push(Index { name: idx_name, columns: cols, unique });
+                indexes.push(Index {
+                    name: idx_name,
+                    columns: cols,
+                    unique,
+                });
             }
         }
 
@@ -289,8 +296,11 @@ pub async fn pk_bounds(
     if let Some(w) = filter {
         sql.push_str(&format!(" WHERE {w}"));
     }
-    let row: Option<mysql_async::Row> =
-        src.conn.query_first(sql).await.context("读取主键范围失败")?;
+    let row: Option<mysql_async::Row> = src
+        .conn
+        .query_first(sql)
+        .await
+        .context("读取主键范围失败")?;
     let Some(row) = row else { return Ok(None) };
     let lo: Option<i64> = row.get(0);
     let hi: Option<i64> = row.get(1);
@@ -314,10 +324,10 @@ pub async fn views(src: &mut MySource, filter: Option<&[String]>) -> Result<Vec<
     let mut out = Vec::new();
     for row in rows {
         let name: String = row.get(0).unwrap_or_default();
-        if let Some(f) = filter {
-            if !f.iter().any(|t| t == &name) {
-                continue;
-            }
+        if let Some(f) = filter
+            && !f.iter().any(|t| t == &name)
+        {
+            continue;
         }
         // 权限不足时 VIEW_DEFINITION 为 NULL，跳过并交给调用方统计
         let definition: Option<String> = row.get(1);
@@ -333,7 +343,11 @@ pub async fn count(src: &mut MySource, table: &Table) -> Result<i64> {
         "SELECT count(*) FROM {}",
         Dialect::Mysql.qualified(&src.ns, &table.name)
     );
-    let value: Option<i64> = src.conn.query_first(sql).await.context("MySQL 统计行数失败")?;
+    let value: Option<i64> = src
+        .conn
+        .query_first(sql)
+        .await
+        .context("MySQL 统计行数失败")?;
     Ok(value.unwrap_or(0))
 }
 
@@ -343,7 +357,11 @@ pub async fn max_text(src: &mut MySource, table: &Table, column: &str) -> Result
         Dialect::Mysql.quote(column),
         Dialect::Mysql.qualified(&src.ns, &table.name)
     );
-    let value: Option<MyValue> = src.conn.query_first(sql).await.context("读取水位最大值失败")?;
+    let value: Option<MyValue> = src
+        .conn
+        .query_first(sql)
+        .await
+        .context("读取水位最大值失败")?;
     let kind = table
         .columns
         .iter()
@@ -356,6 +374,7 @@ pub async fn max_text(src: &mut MySource, table: &Table, column: &str) -> Result
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn copy_table(
     src: &mut MySource,
     table: &Table,
@@ -393,17 +412,20 @@ pub async fn copy_table(
             conditions.push(format!("({w})"));
         }
     }
-    if let Some(f) = filter {
-        if table.columns.iter().any(|c| c.name == f.column) {
-            conditions.push(format!("{} > ?", Dialect::Mysql.quote(&f.column)));
-            params.push(MyValue::from(f.after.clone()));
-        }
+    if let Some(f) = filter
+        && table.columns.iter().any(|c| c.name == f.column)
+    {
+        conditions.push(format!("{} > ?", Dialect::Mysql.quote(&f.column)));
+        params.push(MyValue::from(f.after.clone()));
     }
-    if let (Some(r), Some(idx)) = (resume, resume_idx) {
-        if let Some(after) = &r.after {
-            conditions.push(format!("{} > ?", Dialect::Mysql.quote(&table.columns[idx].name)));
-            params.push(MyValue::from(after.clone()));
-        }
+    if let (Some(r), Some(idx)) = (resume, resume_idx)
+        && let Some(after) = &r.after
+    {
+        conditions.push(format!(
+            "{} > ?",
+            Dialect::Mysql.quote(&table.columns[idx].name)
+        ));
+        params.push(MyValue::from(after.clone()));
     }
     if !conditions.is_empty() {
         sql.push_str(" WHERE ");
@@ -415,7 +437,11 @@ pub async fn copy_table(
             Dialect::Mysql.quote(&table.columns[idx].name)
         ));
     }
-    let params = if params.is_empty() { Params::Empty } else { Params::Positional(params) };
+    let params = if params.is_empty() {
+        Params::Empty
+    } else {
+        Params::Positional(params)
+    };
 
     let mut result = src
         .conn
@@ -440,18 +466,16 @@ pub async fn copy_table(
                     Value::Null
                 }
                 // 二进制列保留字节，避免 UTF-8 转换破坏数据
-                Some(MyValue::Bytes(b)) if matches!(col.kind, ColumnKind::Bytes) => {
-                    Value::Bytes(b)
-                }
+                Some(MyValue::Bytes(b)) if matches!(col.kind, ColumnKind::Bytes) => Value::Bytes(b),
                 Some(v) => Value::Text(
                     value_as_text(&col.kind, v)
                         .with_context(|| format!("列 {} 的值无法转成文本", col.name))?,
                 ),
             };
-            if Some(col.name.as_str()) == watermark {
-                if let Some(t) = value.as_text() {
-                    stat.last_key = Some(t.to_string());
-                }
+            if Some(col.name.as_str()) == watermark
+                && let Some(t) = value.as_text()
+            {
+                stat.last_key = Some(t.to_string());
             }
             values.push(value);
         }
@@ -485,7 +509,11 @@ fn report_progress(
     let (Some(idx), Some(r)) = (pk_idx, resume) else {
         return;
     };
-    if let Some(key) = batch.last().and_then(|row| row.get(idx)).and_then(|v| v.as_text()) {
+    if let Some(key) = batch
+        .last()
+        .and_then(|row| row.get(idx))
+        .and_then(|v| v.as_text())
+    {
         *last = Some(key.to_string());
     }
     if let (Some(key), Some(cb)) = (last.as_deref(), &r.on_progress) {

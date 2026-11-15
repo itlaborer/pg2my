@@ -79,10 +79,8 @@ pub async fn run(
     let mut backoff = Duration::from_secs(1);
 
     loop {
-        let conn = match Conn::new(
-            Opts::from_url(&src_ep.url).context("MySQL 连接串格式不对")?,
-        )
-        .await
+        let conn = match Conn::new(Opts::from_url(&src_ep.url).context("MySQL 连接串格式不对")?)
+            .await
         {
             Ok(conn) => conn,
             Err(e) => {
@@ -91,7 +89,10 @@ pub async fn run(
                 if matches!(server_code(&err), Some(1044 | 1045 | 1251)) {
                     return Err(err.context("连接源 MySQL 失败"));
                 }
-                eprintln!("  连接源 MySQL 失败：{err:#}，{}s 后重试", backoff.as_secs());
+                eprintln!(
+                    "  连接源 MySQL 失败：{err:#}，{}s 后重试",
+                    backoff.as_secs()
+                );
                 tokio::time::sleep(backoff).await;
                 backoff = next_backoff(backoff);
                 continue;
@@ -190,7 +191,10 @@ pub async fn run(
                 _ => {}
             }
             if last_save.elapsed() >= Duration::from_secs(1) {
-                checkpoint.binlog = Some(BinlogPos { file: file.clone(), pos });
+                checkpoint.binlog = Some(BinlogPos {
+                    file: file.clone(),
+                    pos,
+                });
                 if let Some(path) = checkpoint_path {
                     checkpoint.save(path)?;
                 }
@@ -198,7 +202,10 @@ pub async fn run(
             }
         }
 
-        checkpoint.binlog = Some(BinlogPos { file: file.clone(), pos });
+        checkpoint.binlog = Some(BinlogPos {
+            file: file.clone(),
+            pos,
+        });
         if let Some(path) = checkpoint_path {
             checkpoint.save(path)?;
         }
@@ -248,7 +255,10 @@ fn collect_rows(
         RowsEventData::UpdateRowsEvent(_) | RowsEventData::UpdateRowsEventV1(_) => "update",
         RowsEventData::DeleteRowsEvent(_) | RowsEventData::DeleteRowsEventV1(_) => "delete",
         RowsEventData::PartialUpdateRowsEvent(_) => {
-            eprintln!("  binlog 跳过 {}：暂不支持 PARTIAL_UPDATE_ROWS_EVENT", table.name);
+            eprintln!(
+                "  binlog 跳过 {}：暂不支持 PARTIAL_UPDATE_ROWS_EVENT",
+                table.name
+            );
             return Ok(());
         }
     };
@@ -406,20 +416,14 @@ fn convert(kind: &ColumnKind, value: &BinlogValue<'_>) -> Result<Value> {
     Ok(match raw {
         MyValue::NULL => Value::Null,
         // MariaDB 的 TIMESTAMP 在 binlog 里是 epoch 秒，需要还原成日期文本
-        MyValue::Int(i)
-            if matches!(kind, ColumnKind::Timestamp | ColumnKind::TimestampTz) =>
-        {
+        MyValue::Int(i) if matches!(kind, ColumnKind::Timestamp | ColumnKind::TimestampTz) => {
             Value::Text(epoch_to_datetime(i))
         }
-        MyValue::UInt(u)
-            if matches!(kind, ColumnKind::Timestamp | ColumnKind::TimestampTz) =>
-        {
+        MyValue::UInt(u) if matches!(kind, ColumnKind::Timestamp | ColumnKind::TimestampTz) => {
             Value::Text(epoch_to_datetime(u as i64))
         }
         // TIMESTAMP2 在 mysql_common 里被解码成“epoch 秒的十进制字节串”
-        MyValue::Bytes(b)
-            if matches!(kind, ColumnKind::Timestamp | ColumnKind::TimestampTz) =>
-        {
+        MyValue::Bytes(b) if matches!(kind, ColumnKind::Timestamp | ColumnKind::TimestampTz) => {
             let text = String::from_utf8_lossy(&b);
             match text.parse::<f64>() {
                 Ok(secs) => Value::Text(epoch_to_datetime_frac(secs)),
@@ -469,10 +473,7 @@ fn enum_text(labels: &[String], index: i64) -> String {
     if index <= 0 {
         return String::new();
     }
-    labels
-        .get(index as usize - 1)
-        .cloned()
-        .unwrap_or_default()
+    labels.get(index as usize - 1).cloned().unwrap_or_default()
 }
 
 /// epoch 秒（可带小数）→ UTC 的 "YYYY-MM-DD HH:MM:SS.ffffff"。

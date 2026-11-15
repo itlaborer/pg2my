@@ -30,7 +30,9 @@ pub fn parse_pg(
             }
             _ => parse_pg_base(full_type.trim_end_matches("[]"), Vec::new()),
         };
-        return ColumnKind::Array { elem: Box::new(elem) };
+        return ColumnKind::Array {
+            elem: Box::new(elem),
+        };
     }
     if typtype == "e" {
         return ColumnKind::Enum { labels };
@@ -51,10 +53,18 @@ fn parse_pg_base(full_type: &str, labels: Vec<String>) -> ColumnKind {
         "bigint" | "int8" | "oid" => ColumnKind::BigInt,
         "real" | "float4" => ColumnKind::Real,
         "double precision" | "float8" => ColumnKind::Double,
-        "numeric" | "decimal" => ColumnKind::Numeric { precision: p, scale: s },
-        "money" => ColumnKind::Numeric { precision: Some(19), scale: Some(2) },
+        "numeric" | "decimal" => ColumnKind::Numeric {
+            precision: p,
+            scale: s,
+        },
+        "money" => ColumnKind::Numeric {
+            precision: Some(19),
+            scale: Some(2),
+        },
         "character varying" | "varchar" => ColumnKind::Text { max_len: p },
-        "character" | "char" | "bpchar" => ColumnKind::FixedText { len: p.unwrap_or(1) },
+        "character" | "char" | "bpchar" => ColumnKind::FixedText {
+            len: p.unwrap_or(1),
+        },
         "text" | "citext" | "name" | "xml" | "tsvector" => ColumnKind::Text { max_len: None },
         "bytea" => ColumnKind::Bytes,
         "date" => ColumnKind::Date,
@@ -65,12 +75,23 @@ fn parse_pg_base(full_type: &str, labels: Vec<String>) -> ColumnKind {
         "json" | "jsonb" | "hstore" => ColumnKind::Json,
         "enum" => ColumnKind::Enum { labels },
         // 这些 PG 类型在 MySQL 里没有等价物，但 PG→PG 时可以原样保留
-        "interval" | "inet" | "cidr" | "macaddr" | "macaddr8" | "bit" | "bit varying" | "varbit"
-        | "time with time zone" | "timetz" => ColumnKind::Other {
+        "interval"
+        | "inet"
+        | "cidr"
+        | "macaddr"
+        | "macaddr8"
+        | "bit"
+        | "bit varying"
+        | "varbit"
+        | "time with time zone"
+        | "timetz" => ColumnKind::Other {
             source: full_type.to_string(),
             pg_type: Some(full_type.to_string()),
         },
-        _ => ColumnKind::Other { source: full_type.to_string(), pg_type: None },
+        _ => ColumnKind::Other {
+            source: full_type.to_string(),
+            pg_type: None,
+        },
     }
 }
 
@@ -123,25 +144,35 @@ pub fn parse_mysql(
         }
         "float" => ColumnKind::Real,
         "double" | "real" => ColumnKind::Double,
-        "decimal" | "numeric" => ColumnKind::Numeric { precision: p, scale: s },
-        "char" => ColumnKind::FixedText { len: char_len.unwrap_or(1) },
+        "decimal" | "numeric" => ColumnKind::Numeric {
+            precision: p,
+            scale: s,
+        },
+        "char" => ColumnKind::FixedText {
+            len: char_len.unwrap_or(1),
+        },
         "varchar" => ColumnKind::Text { max_len: char_len },
         "tinytext" | "text" | "mediumtext" | "longtext" => ColumnKind::Text { max_len: None },
         // 二进制与空间类型都按字节搬运，避免 UTF-8 转换失败
         "binary" | "varbinary" | "tinyblob" | "blob" | "mediumblob" | "longblob" | "bit"
-        | "geometry" | "point" | "linestring" | "polygon" | "multipoint"
-        | "multilinestring" | "multipolygon" | "geomcollection" | "geometrycollection" => {
-            ColumnKind::Bytes
-        }
+        | "geometry" | "point" | "linestring" | "polygon" | "multipoint" | "multilinestring"
+        | "multipolygon" | "geomcollection" | "geometrycollection" => ColumnKind::Bytes,
         "date" => ColumnKind::Date,
         "time" => ColumnKind::Time,
         "datetime" => ColumnKind::Timestamp,
         "timestamp" => ColumnKind::TimestampTz,
         "year" => ColumnKind::SmallInt,
         "json" => ColumnKind::Json,
-        "enum" => ColumnKind::Enum { labels: parse_mysql_labels(column_type) },
-        "set" => ColumnKind::Set { labels: parse_mysql_labels(column_type) },
-        _ => ColumnKind::Other { source: column_type.to_string(), pg_type: None },
+        "enum" => ColumnKind::Enum {
+            labels: parse_mysql_labels(column_type),
+        },
+        "set" => ColumnKind::Set {
+            labels: parse_mysql_labels(column_type),
+        },
+        _ => ColumnKind::Other {
+            source: column_type.to_string(),
+            pg_type: None,
+        },
     }
 }
 
@@ -150,7 +181,10 @@ fn parse_mysql_labels(column_type: &str) -> Vec<String> {
     let Some(open) = column_type.find('(') else {
         return Vec::new();
     };
-    let inner: Vec<char> = column_type[open + 1..].trim_end_matches(')').chars().collect();
+    let inner: Vec<char> = column_type[open + 1..]
+        .trim_end_matches(')')
+        .chars()
+        .collect();
     let mut labels = Vec::new();
     let mut cur = String::new();
     let mut in_quote = false;
@@ -216,7 +250,9 @@ pub fn pg_type(kind: &ColumnKind, enum_type: &str) -> String {
         ColumnKind::Enum { .. } => enum_type.to_string(),
         ColumnKind::Set { .. } => "text".to_string(),
         ColumnKind::Array { elem } => format!("{}[]", pg_type(elem, enum_type)),
-        ColumnKind::Other { pg_type: Some(t), .. } => t.clone(),
+        ColumnKind::Other {
+            pg_type: Some(t), ..
+        } => t.clone(),
         ColumnKind::Other { .. } => "text".to_string(),
     }
 }
@@ -324,18 +360,29 @@ mod tests {
 
     #[test]
     fn pg_array_of_enum() {
-        let kind = parse_pg("mood[]", "b", "A", Some("e"), Some("mood"), vec!["a".into(), "b".into()]);
+        let kind = parse_pg(
+            "mood[]",
+            "b",
+            "A",
+            Some("e"),
+            Some("mood"),
+            vec!["a".into(), "b".into()],
+        );
         assert_eq!(
             kind,
             ColumnKind::Array {
-                elem: Box::new(ColumnKind::Enum { labels: vec!["a".into(), "b".into()] })
+                elem: Box::new(ColumnKind::Enum {
+                    labels: vec!["a".into(), "b".into()]
+                })
             }
         );
     }
 
     #[test]
     fn pg_array_renders_with_type() {
-        let kind = ColumnKind::Array { elem: Box::new(ColumnKind::Int) };
+        let kind = ColumnKind::Array {
+            elem: Box::new(ColumnKind::Int),
+        };
         assert_eq!(pg_type(&kind, "\"public\".\"t_c\""), "integer[]");
     }
 
@@ -343,7 +390,9 @@ mod tests {
     fn mysql_enum_labels() {
         assert_eq!(
             parse_mysql("enum", "enum('a','b,c','d''e')", None, None, None),
-            ColumnKind::Enum { labels: vec!["a".into(), "b,c".into(), "d'e".into()] }
+            ColumnKind::Enum {
+                labels: vec!["a".into(), "b,c".into(), "d'e".into()]
+            }
         );
     }
 
@@ -385,7 +434,9 @@ mod tests {
 
     #[test]
     fn mysql_enum_renders_escaped() {
-        let kind = ColumnKind::Enum { labels: vec!["a".into(), "d'e".into()] };
+        let kind = ColumnKind::Enum {
+            labels: vec!["a".into(), "d'e".into()],
+        };
         assert_eq!(mysql_type(&kind), "ENUM('a', 'd''e')");
     }
 }

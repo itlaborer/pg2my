@@ -28,9 +28,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use crate::checkpoint::Checkpoint;
-use crate::model::{
-    ColumnKind, CopyStat, Dialect, Endpoint, RowResume, Table, apply_env_password,
-};
+use crate::model::{ColumnKind, CopyStat, Dialect, Endpoint, RowResume, Table, apply_env_password};
 use crate::sink::Sink;
 use crate::source::Source;
 
@@ -198,7 +196,11 @@ async fn main() -> Result<()> {
 
     // 排除表优先于 --tables
     if let Some(list) = &cli.exclude_tables {
-        let excluded: Vec<&str> = list.split(',').map(|t| t.trim()).filter(|t| !t.is_empty()).collect();
+        let excluded: Vec<&str> = list
+            .split(',')
+            .map(|t| t.trim())
+            .filter(|t| !t.is_empty())
+            .collect();
         let before = tables.len();
         tables.retain(|t| !excluded.contains(&t.name.as_str()));
         if tables.len() != before {
@@ -224,7 +226,9 @@ async fn main() -> Result<()> {
             "  警告：MySQL 源不支持跨表一致性快照，--parallel {} 时各表读取时点可能不同。",
             cli.parallel
         );
-        eprintln!("        需要严格一致请用 --parallel 1，或改用 --cdc --cdc-mode binlog 在全量后追平。");
+        eprintln!(
+            "        需要严格一致请用 --parallel 1，或改用 --cdc --cdc-mode binlog 在全量后追平。"
+        );
     }
     if src_dialect == Dialect::Mysql && cli.shards > 1 {
         eprintln!("  警告：MySQL 源按主键分片时，各片各自开启一致性快照，跨片时点可能不同。");
@@ -232,7 +236,10 @@ async fn main() -> Result<()> {
 
     if cli.dry_run {
         print_ddl(src_dialect, dst_dialect, &dst_ns, &tables);
-        println!("-- 数据搬运计划（每批 {} 行，并行 {}）：", cli.batch_size, cli.parallel);
+        println!(
+            "-- 数据搬运计划（每批 {} 行，并行 {}）：",
+            cli.batch_size, cli.parallel
+        );
         for table in &tables {
             let mut line = format!("--   {}", table.name);
             if let Some(w) = &cli.where_clause {
@@ -282,8 +289,14 @@ async fn main() -> Result<()> {
             column: cli.cdc_column.clone(),
             batch_size: cli.batch_size,
         };
-        cdc::prime_watermarks(&src_ep, &tables, &opts, &mut checkpoint, cli.checkpoint.as_deref())
-            .await?;
+        cdc::prime_watermarks(
+            &src_ep,
+            &tables,
+            &opts,
+            &mut checkpoint,
+            cli.checkpoint.as_deref(),
+        )
+        .await?;
     }
     let checkpoint = Arc::new(Mutex::new(checkpoint));
 
@@ -311,7 +324,10 @@ async fn main() -> Result<()> {
                 "DROP VIEW IF EXISTS {} CASCADE",
                 dst_dialect.qualified(&dst_ns, &view.name)
             );
-            target.exec(&sql).await.with_context(|| format!("删除视图 {} 失败", view.name))?;
+            target
+                .exec(&sql)
+                .await
+                .with_context(|| format!("删除视图 {} 失败", view.name))?;
         }
     }
     for table in &tables {
@@ -344,7 +360,9 @@ async fn main() -> Result<()> {
             .collect();
         if !missing.is_empty() {
             println!("  补列 {:<32} {}", table.name, missing.join(", "));
-            for sql in ddl::add_column_statements(src_dialect, dst_dialect, &dst_ns, table, &missing) {
+            for sql in
+                ddl::add_column_statements(src_dialect, dst_dialect, &dst_ns, table, &missing)
+            {
                 target
                     .exec(&sql)
                     .await
@@ -372,10 +390,19 @@ async fn main() -> Result<()> {
                 }
                 if cli.sync_schema {
                     let sqls = ddl::sync_column_statements(
-                        src_dialect, dst_dialect, &dst_ns, table, col, type_diff, null_diff,
+                        src_dialect,
+                        dst_dialect,
+                        &dst_ns,
+                        table,
+                        col,
+                        type_diff,
+                        null_diff,
                     );
                     if sqls.is_empty() {
-                        println!("  差异 {:<32} {} 自定义类型需人工处理", table.name, col.name);
+                        println!(
+                            "  差异 {:<32} {} 自定义类型需人工处理",
+                            table.name, col.name
+                        );
                         continue;
                     }
                     for sql in sqls {
@@ -471,49 +498,54 @@ async fn main() -> Result<()> {
                     sink.truncate(&table).await?;
                 }
                 // 单表分片：整数单列主键、非续搬、非 upsert 时按主键范围拆成多个并发任务
-                if shards > 1 && !upsert && resume.is_none() {
-                    if let Some(pk) = shard_column(&table) {
-                        let conds = shard_conditions(
-                            &mut src,
-                            src_ep.dialect,
-                            &table,
-                            pk,
-                            shards,
-                            where_clause.as_deref(),
-                        )
-                        .await?;
-                        if !conds.is_empty() {
-                            // 先释放外层连接，避免与各分片连接叠加
-                            drop(sink);
-                            let mut futs = Vec::with_capacity(conds.len());
-                            for cond in conds {
-                                let src_ep = src_ep.clone();
-                                let dst_ep = dst_ep.clone();
-                                let snapshot = snapshot.clone();
-                                let table = table.clone();
-                                futs.push(async move {
-                                    let mut s =
-                                        Source::connect_snapshot(&src_ep, snapshot.as_deref()).await?;
-                                    let mut k = Sink::connect(&dst_ep).await?;
-                                    s.copy(
-                                        &table,
-                                        dst_ep.dialect,
-                                        batch_size,
-                                        None,
-                                        &mut k,
-                                        false,
-                                        None,
-                                        copy_mode,
-                                        None,
-                                        Some(&cond),
-                                    )
-                                    .await
-                                });
-                            }
-                            let stats = futures_util::future::try_join_all(futs).await?;
-                            let rows = stats.iter().map(|s| s.rows).sum();
-                            return Ok(CopyStat { rows, last_key: None });
+                if shards > 1
+                    && !upsert
+                    && resume.is_none()
+                    && let Some(pk) = shard_column(&table)
+                {
+                    let conds = shard_conditions(
+                        &mut src,
+                        src_ep.dialect,
+                        &table,
+                        pk,
+                        shards,
+                        where_clause.as_deref(),
+                    )
+                    .await?;
+                    if !conds.is_empty() {
+                        // 先释放外层连接，避免与各分片连接叠加
+                        drop(sink);
+                        let mut futs = Vec::with_capacity(conds.len());
+                        for cond in conds {
+                            let src_ep = src_ep.clone();
+                            let dst_ep = dst_ep.clone();
+                            let snapshot = snapshot.clone();
+                            let table = table.clone();
+                            futs.push(async move {
+                                let mut s =
+                                    Source::connect_snapshot(&src_ep, snapshot.as_deref()).await?;
+                                let mut k = Sink::connect(&dst_ep).await?;
+                                s.copy(
+                                    &table,
+                                    dst_ep.dialect,
+                                    batch_size,
+                                    None,
+                                    &mut k,
+                                    false,
+                                    None,
+                                    copy_mode,
+                                    None,
+                                    Some(&cond),
+                                )
+                                .await
+                            });
                         }
+                        let stats = futures_util::future::try_join_all(futs).await?;
+                        let rows = stats.iter().map(|s| s.rows).sum();
+                        return Ok(CopyStat {
+                            rows,
+                            last_key: None,
+                        });
                     }
                 }
                 let copy = copy_mode;
@@ -525,7 +557,10 @@ async fn main() -> Result<()> {
                     && where_clause.is_none();
                 if direct {
                     let rows = src.copy_direct(&table, &mut sink).await?;
-                    Ok(CopyStat { rows, last_key: None })
+                    Ok(CopyStat {
+                        rows,
+                        last_key: None,
+                    })
                 } else {
                     src.copy(
                         &table,
@@ -672,7 +707,10 @@ async fn main() -> Result<()> {
         }
     }
 
-    println!("\n全量迁移完成，耗时 {:.1}s", started.elapsed().as_secs_f64());
+    println!(
+        "\n全量迁移完成，耗时 {:.1}s",
+        started.elapsed().as_secs_f64()
+    );
     if warnings > 0 {
         println!("有 {warnings} 条补充 DDL 未成功（见上方 warn）");
     }
@@ -753,7 +791,11 @@ async fn create_foreign_key(
 }
 
 /// 构造行级断点：仅 `--resume` 且单列主键时启用，进度最多每秒落盘一次。
-fn build_resume(checkpoint: &Arc<Mutex<Checkpoint>>, cli: &Cli, table: &Table) -> Option<RowResume> {
+fn build_resume(
+    checkpoint: &Arc<Mutex<Checkpoint>>,
+    cli: &Cli,
+    table: &Table,
+) -> Option<RowResume> {
     if !cli.resume || table.primary_key.len() != 1 {
         return None;
     }
@@ -821,8 +863,11 @@ fn shard_column(table: &Table) -> Option<&str> {
     }
     let name = table.primary_key[0].as_str();
     let col = table.columns.iter().find(|c| c.name == name)?;
-    matches!(col.kind, ColumnKind::SmallInt | ColumnKind::Int | ColumnKind::BigInt)
-        .then_some(name)
+    matches!(
+        col.kind,
+        ColumnKind::SmallInt | ColumnKind::Int | ColumnKind::BigInt
+    )
+    .then_some(name)
 }
 
 /// 把整数主键区间均分成 n 段，返回每段可直接追加到源查询的过滤条件。

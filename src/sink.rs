@@ -5,6 +5,12 @@ use anyhow::Result;
 use crate::model::{ColumnState, Dialect, Endpoint, Table, Value};
 use crate::{my_target, pg_target};
 
+/// 单条 INSERT 的占位符上限是 65535（PG 扩展协议与 MySQL 预处理相同），留些余量。
+/// 按列数换算出每批行数，两种目标方言共用同一套切批规则。
+pub(crate) fn rows_per_statement(ncols: usize) -> usize {
+    (60000 / ncols.max(1)).max(1)
+}
+
 pub enum Sink {
     Pg(pg_target::PgTarget),
     My(my_target::MyTarget),
@@ -13,12 +19,8 @@ pub enum Sink {
 impl Sink {
     pub async fn connect(ep: &Endpoint) -> Result<Self> {
         match ep.dialect {
-            Dialect::Postgres => Ok(Sink::Pg(
-                pg_target::connect(&ep.url, &ep.namespace).await?,
-            )),
-            Dialect::Mysql => Ok(Sink::My(
-                my_target::connect(&ep.url, &ep.namespace).await?,
-            )),
+            Dialect::Postgres => Ok(Sink::Pg(pg_target::connect(&ep.url, &ep.namespace).await?)),
+            Dialect::Mysql => Ok(Sink::My(my_target::connect(&ep.url, &ep.namespace).await?)),
         }
     }
 
@@ -69,12 +71,7 @@ impl Sink {
                 match result {
                     Ok(n) => return Ok(n),
                     Err(e) if attempt < 3 && retryable(&e) => {
-                        eprintln!(
-                            "  重试 {}（第 {} 次）：{}",
-                            table.name,
-                            attempt,
-                            format!("{e:#}")
-                        );
+                        eprintln!("  重试 {}（第 {} 次）：{e:#}", table.name, attempt);
                         tokio::time::sleep(std::time::Duration::from_millis(200 * attempt)).await;
                     }
                     Err(e) => return Err(e),
@@ -147,7 +144,7 @@ impl Sink {
             match result {
                 Ok(n) => return Ok(n),
                 Err(e) if attempt < 3 && retryable(&e) => {
-                    eprintln!("  重试 {}（第 {} 次）：{}", table.name, attempt, format!("{e:#}"));
+                    eprintln!("  重试 {}（第 {} 次）：{e:#}", table.name, attempt);
                     tokio::time::sleep(std::time::Duration::from_millis(200 * attempt)).await;
                 }
                 Err(e) => return Err(e),

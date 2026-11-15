@@ -30,8 +30,18 @@ fn watermark_column(table: &Table, explicit: Option<&str>) -> Option<String> {
             .any(|c| c.name == name)
             .then(|| name.to_string());
     }
-    for candidate in ["updated_at", "update_time", "modified_at", "gmt_modified", "last_modified"] {
-        if let Some(col) = table.columns.iter().find(|c| c.name.eq_ignore_ascii_case(candidate)) {
+    for candidate in [
+        "updated_at",
+        "update_time",
+        "modified_at",
+        "gmt_modified",
+        "last_modified",
+    ] {
+        if let Some(col) = table
+            .columns
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(candidate))
+        {
             return Some(col.name.clone());
         }
     }
@@ -91,10 +101,10 @@ pub async fn run(
             println!("  跳过 {}：没有主键，无法 upsert", table.name);
             continue;
         }
-        if checkpoint.watermark(&table.name).is_none() {
-            if let Some(max) = src.max_text(table, &col).await? {
-                checkpoint.set_watermark(&table.name, &max);
-            }
+        if checkpoint.watermark(&table.name).is_none()
+            && let Some(max) = src.max_text(table, &col).await?
+        {
+            checkpoint.set_watermark(&table.name, &max);
         }
         println!("  表 {:<32} 水位列 {}", table.name, col);
     }
@@ -102,7 +112,10 @@ pub async fn run(
         checkpoint.save(path)?;
     }
 
-    println!("\n进入增量同步，每 {}s 轮询一次，Ctrl-C 退出", opts.interval_secs);
+    println!(
+        "\n进入增量同步，每 {}s 轮询一次，Ctrl-C 退出",
+        opts.interval_secs
+    );
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
@@ -121,7 +134,10 @@ pub async fn run(
             }
             let filter = checkpoint
                 .watermark(&table.name)
-                .map(|after| IncrementalFilter { column: col.clone(), after: after.clone() });
+                .map(|after| IncrementalFilter {
+                    column: col.clone(),
+                    after: after.clone(),
+                });
             let stat = match src
                 .copy(
                     table,

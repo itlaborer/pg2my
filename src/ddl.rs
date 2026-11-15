@@ -30,7 +30,10 @@ fn enum_labels(kind: &ColumnKind) -> Option<&Vec<String>> {
 }
 
 pub fn is_int_kind(kind: &ColumnKind) -> bool {
-    matches!(kind, ColumnKind::SmallInt | ColumnKind::Int | ColumnKind::BigInt)
+    matches!(
+        kind,
+        ColumnKind::SmallInt | ColumnKind::Int | ColumnKind::BigInt
+    )
 }
 
 /// MySQL 的 AUTO_INCREMENT 只支持整数类型，BIGINT UNSIGNED 也算。
@@ -81,7 +84,9 @@ fn pg_create(src: Dialect, ns: &str, table: &Table) -> Vec<String> {
             if col.not_null {
                 line.push_str(" NOT NULL");
             }
-            if let Some(def) = translate_default(src, Dialect::Postgres, &col.kind, col.default.as_deref()) {
+            if let Some(def) =
+                translate_default(src, Dialect::Postgres, &col.kind, col.default.as_deref())
+            {
                 line.push_str(" DEFAULT ");
                 line.push_str(&def);
             }
@@ -109,7 +114,10 @@ fn pg_create(src: Dialect, ns: &str, table: &Table) -> Vec<String> {
             .collect::<Vec<_>>()
             .join(", ");
         let name = truncate_ident(&format!("{}_pkey", table.name), 60);
-        lines.push(format!("  CONSTRAINT {} PRIMARY KEY ({cols})", q.quote(&name)));
+        lines.push(format!(
+            "  CONSTRAINT {} PRIMARY KEY ({cols})",
+            q.quote(&name)
+        ));
     }
 
     out.push(format!(
@@ -147,18 +155,24 @@ pub fn mysql_column_def(src: Dialect, table: &Table, col: &Column) -> String {
         if col.not_null {
             line.push_str(" NOT NULL");
         }
-        if let Some(def) = translate_default(src, Dialect::Mysql, &col.kind, col.default.as_deref()) {
+        if let Some(def) = translate_default(src, Dialect::Mysql, &col.kind, col.default.as_deref())
+        {
             line.push_str(" DEFAULT ");
             line.push_str(&def);
         }
     }
-    if let Some(comment) = &col.comment {
-        if !comment.is_empty() {
-            line.push_str(&format!(" COMMENT '{}'", type_map::escape_mysql_literal(comment)));
-        }
+    if let Some(comment) = &col.comment
+        && !comment.is_empty()
+    {
+        line.push_str(&format!(
+            " COMMENT '{}'",
+            type_map::escape_mysql_literal(comment)
+        ));
     }
     // 保留 MySQL 的 ON UPDATE CURRENT_TIMESTAMP 语义
-    if col.on_update_timestamp && matches!(col.kind, ColumnKind::Timestamp | ColumnKind::TimestampTz) {
+    if col.on_update_timestamp
+        && matches!(col.kind, ColumnKind::Timestamp | ColumnKind::TimestampTz)
+    {
         line.push_str(" ON UPDATE CURRENT_TIMESTAMP");
     }
     line
@@ -202,13 +216,13 @@ fn mysql_create(src: Dialect, ns: &str, table: &Table) -> Vec<String> {
         q.qualified(ns, &table.name),
         lines.join(",\n")
     );
-    if let Some(comment) = &table.comment {
-        if !comment.is_empty() {
-            sql.push_str(&format!(
-                " COMMENT='{}'",
-                type_map::escape_mysql_literal(comment)
-            ));
-        }
+    if let Some(comment) = &table.comment
+        && !comment.is_empty()
+    {
+        sql.push_str(&format!(
+            " COMMENT='{}'",
+            type_map::escape_mysql_literal(comment)
+        ));
     }
     vec![sql]
 }
@@ -234,7 +248,9 @@ pub fn add_column_statements(
                     q.quote(&col.name)
                 );
                 // 带默认值，存量行也能得到源库的默认语义；仍保持可空，避免加列失败
-                if let Some(def) = translate_default(src, Dialect::Postgres, &col.kind, col.default.as_deref()) {
+                if let Some(def) =
+                    translate_default(src, Dialect::Postgres, &col.kind, col.default.as_deref())
+                {
                     sql.push_str(" DEFAULT ");
                     sql.push_str(&def);
                 }
@@ -243,17 +259,19 @@ pub fn add_column_statements(
             Dialect::Mysql => {
                 let ty = type_map::mysql_type(&col.kind);
                 let mut line = format!("{} {ty}", q.quote(&col.name));
-                if let Some(def) = translate_default(src, Dialect::Mysql, &col.kind, col.default.as_deref()) {
+                if let Some(def) =
+                    translate_default(src, Dialect::Mysql, &col.kind, col.default.as_deref())
+                {
                     line.push_str(" DEFAULT ");
                     line.push_str(&def);
                 }
-                if let Some(comment) = &col.comment {
-                    if !comment.is_empty() {
-                        line.push_str(&format!(
-                            " COMMENT '{}'",
-                            type_map::escape_mysql_literal(comment)
-                        ));
-                    }
+                if let Some(comment) = &col.comment
+                    && !comment.is_empty()
+                {
+                    line.push_str(&format!(
+                        " COMMENT '{}'",
+                        type_map::escape_mysql_literal(comment)
+                    ));
                 }
                 format!(
                     "ALTER TABLE {} ADD COLUMN {line}",
@@ -369,7 +387,12 @@ pub fn foreign_key_statement(
         Dialect::Postgres => truncate_ident(&fk.name, 60),
         Dialect::Mysql => mysql_fk_name(table, &fk.name),
     };
-    let cols = fk.columns.iter().map(|c| q.quote(c)).collect::<Vec<_>>().join(", ");
+    let cols = fk
+        .columns
+        .iter()
+        .map(|c| q.quote(c))
+        .collect::<Vec<_>>()
+        .join(", ");
     let ref_cols = fk
         .ref_columns
         .iter()
@@ -413,7 +436,10 @@ pub fn drop_foreign_key_statements(target: Dialect, ns: &str, table: &Table) -> 
                     q.quote(&name)
                 ),
                 Dialect::Mysql => {
-                    format!("ALTER TABLE {table_sql} DROP FOREIGN KEY {}", q.quote(&name))
+                    format!(
+                        "ALTER TABLE {table_sql} DROP FOREIGN KEY {}",
+                        q.quote(&name)
+                    )
                 }
             }
         })
@@ -427,37 +453,37 @@ pub fn comment_statements(target: Dialect, ns: &str, table: &Table) -> Vec<Strin
     }
     let q = Dialect::Postgres;
     let mut out = Vec::new();
-    if let Some(comment) = &table.comment {
-        if !comment.is_empty() {
+    if let Some(comment) = &table.comment
+        && !comment.is_empty()
+    {
+        out.push(format!(
+            "COMMENT ON TABLE {} IS '{}'",
+            q.qualified(ns, &table.name),
+            escape_pg_literal(comment)
+        ));
+    }
+    for col in &table.columns {
+        if let Some(comment) = &col.comment
+            && !comment.is_empty()
+        {
             out.push(format!(
-                "COMMENT ON TABLE {} IS '{}'",
+                "COMMENT ON COLUMN {}.{} IS '{}'",
                 q.qualified(ns, &table.name),
+                q.quote(&col.name),
                 escape_pg_literal(comment)
             ));
         }
     }
-    for col in &table.columns {
-        if let Some(comment) = &col.comment {
-            if !comment.is_empty() {
-                out.push(format!(
-                    "COMMENT ON COLUMN {}.{} IS '{}'",
-                    q.qualified(ns, &table.name),
-                    q.quote(&col.name),
-                    escape_pg_literal(comment)
-                ));
-            }
-        }
-    }
     for g in &table.generated_columns {
-        if let Some(comment) = &g.comment {
-            if !comment.is_empty() {
-                out.push(format!(
-                    "COMMENT ON COLUMN {}.{} IS '{}'",
-                    q.qualified(ns, &table.name),
-                    q.quote(&g.name),
-                    escape_pg_literal(comment)
-                ));
-            }
+        if let Some(comment) = &g.comment
+            && !comment.is_empty()
+        {
+            out.push(format!(
+                "COMMENT ON COLUMN {}.{} IS '{}'",
+                q.qualified(ns, &table.name),
+                q.quote(&g.name),
+                escape_pg_literal(comment)
+            ));
         }
     }
     out
@@ -511,7 +537,10 @@ pub fn standalone_sequence_statements(ns: &str, seq: &Sequence) -> Vec<String> {
     )];
     if let Some(last) = seq.last_value {
         let literal = qualified.replace('\'', "''");
-        out.push(format!("SELECT setval('{literal}', {last}, {})", seq.is_called));
+        out.push(format!(
+            "SELECT setval('{literal}', {last}, {})",
+            seq.is_called
+        ));
     }
     out
 }
@@ -523,7 +552,11 @@ fn escape_pg_literal(s: &str) -> String {
 /// 目标为 MySQL 时，TEXT/BLOB/JSON 不能直接带字面量默认值。
 fn mysql_default_forbidden(kind: &ColumnKind) -> bool {
     let ty = type_map::mysql_type(kind);
-    ty == "LONGTEXT" || ty == "LONGBLOB" || ty == "JSON" || ty.starts_with("TEXT") || ty.starts_with("BLOB")
+    ty == "LONGTEXT"
+        || ty == "LONGBLOB"
+        || ty == "JSON"
+        || ty.starts_with("TEXT")
+        || ty.starts_with("BLOB")
 }
 
 /// 把源库默认值翻译成目标方言能接受的写法；翻译不了就放弃默认值。
@@ -559,8 +592,26 @@ pub fn translate_default(
             let expr = strip_pg_cast(expr);
             let lower = expr.to_ascii_lowercase();
             match lower.as_str() {
-                "true" => return Some(if dst == Dialect::Postgres { "true" } else { "1" }.to_string()),
-                "false" => return Some(if dst == Dialect::Postgres { "false" } else { "0" }.to_string()),
+                "true" => {
+                    return Some(
+                        if dst == Dialect::Postgres {
+                            "true"
+                        } else {
+                            "1"
+                        }
+                        .to_string(),
+                    );
+                }
+                "false" => {
+                    return Some(
+                        if dst == Dialect::Postgres {
+                            "false"
+                        } else {
+                            "0"
+                        }
+                        .to_string(),
+                    );
+                }
                 "null" => return None,
                 _ => {}
             }
@@ -583,9 +634,23 @@ pub fn translate_default(
             match kind {
                 ColumnKind::Bool => {
                     if lower == "1" || lower == "true" {
-                        Some(if dst == Dialect::Postgres { "true" } else { "1" }.to_string())
+                        Some(
+                            if dst == Dialect::Postgres {
+                                "true"
+                            } else {
+                                "1"
+                            }
+                            .to_string(),
+                        )
                     } else if lower == "0" || lower == "false" {
-                        Some(if dst == Dialect::Postgres { "false" } else { "0" }.to_string())
+                        Some(
+                            if dst == Dialect::Postgres {
+                                "false"
+                            } else {
+                                "0"
+                            }
+                            .to_string(),
+                        )
                     } else {
                         None
                     }
@@ -597,7 +662,11 @@ pub fn translate_default(
                 | ColumnKind::Real
                 | ColumnKind::Double
                 | ColumnKind::Numeric { .. } => {
-                    if expr.parse::<f64>().is_ok() { Some(expr.to_string()) } else { None }
+                    if expr.parse::<f64>().is_ok() {
+                        Some(expr.to_string())
+                    } else {
+                        None
+                    }
                 }
                 ColumnKind::Text { .. }
                 | ColumnKind::FixedText { .. }
@@ -607,9 +676,7 @@ pub fn translate_default(
                 | ColumnKind::Date
                 | ColumnKind::Time
                 | ColumnKind::Timestamp
-                | ColumnKind::TimestampTz => {
-                    Some(format!("'{}'", escape_pg_literal(expr)))
-                }
+                | ColumnKind::TimestampTz => Some(format!("'{}'", escape_pg_literal(expr))),
                 _ => None,
             }
         }
@@ -666,7 +733,9 @@ pub fn sync_column_statements(
                 // 枚举/SET 是自定义类型，跨类型转换需要 USING，交人工处理
                 if !matches!(col.kind, ColumnKind::Enum { .. } | ColumnKind::Set { .. }) {
                     let ty = pg_column_type(ns, &table.name, col);
-                    out.push(format!("ALTER TABLE {table_sql} ALTER COLUMN {col_sql} TYPE {ty}"));
+                    out.push(format!(
+                        "ALTER TABLE {table_sql} ALTER COLUMN {col_sql} TYPE {ty}"
+                    ));
                 }
             }
             if null_changed {
@@ -702,7 +771,9 @@ fn normalize_type(s: &str) -> String {
         t = t[dot + 1..].to_string();
     }
     t.retain(|c| !c.is_whitespace());
-    t = t.replace("withtimezone", "tz").replace("withouttimezone", "");
+    t = t
+        .replace("withtimezone", "tz")
+        .replace("withouttimezone", "");
     // MySQL 的 BOOLEAN 是 tinyint(1) 的别名
     if t == "boolean" || t == "bool" {
         t = "tinyint(1)".to_string();
@@ -710,15 +781,18 @@ fn normalize_type(s: &str) -> String {
     // 整数显示宽度不参与比较：int(11) == int
     for prefix in ["tinyint", "smallint", "mediumint", "bigint", "int"] {
         if let Some(rest) = t.strip_prefix(prefix) {
-            if rest.starts_with('(') {
-                if let Some(end) = rest.find(')') {
-                    if rest[1..end].chars().all(|c| c.is_ascii_digit()) {
-                        t = format!("{prefix}{}", &rest[end + 1..]);
-                    }
-                }
+            if rest.starts_with('(')
+                && let Some(end) = rest.find(')')
+                && rest[1..end].chars().all(|c| c.is_ascii_digit())
+            {
+                t = format!("{prefix}{}", &rest[end + 1..]);
             }
             break;
         }
+    }
+    // MariaDB 没有原生 JSON 类型，JSON 列在 information_schema 里显示为 longtext
+    if t == "json" {
+        t = "longtext".to_string();
     }
     for (from, to) in [
         ("charactervarying", "varchar"),
@@ -777,17 +851,26 @@ mod tests {
 
     #[test]
     fn pg_uses_identity_and_comment() {
-        let sql = create_statements(Dialect::Postgres, Dialect::Postgres, "public", &sample_table()).join("\n");
+        let sql = create_statements(
+            Dialect::Postgres,
+            Dialect::Postgres,
+            "public",
+            &sample_table(),
+        )
+        .join("\n");
         assert!(sql.contains("GENERATED BY DEFAULT AS IDENTITY"));
         assert!(sql.contains("CREATE TABLE IF NOT EXISTS \"public\".\"users\""));
-        assert!(comment_statements(Dialect::Postgres, "public", &sample_table())
-            .join("\n")
-            .contains("COMMENT ON TABLE"));
+        assert!(
+            comment_statements(Dialect::Postgres, "public", &sample_table())
+                .join("\n")
+                .contains("COMMENT ON TABLE")
+        );
     }
 
     #[test]
     fn mysql_uses_auto_increment_and_inline_index() {
-        let sql = create_statements(Dialect::Postgres, Dialect::Mysql, "demo", &sample_table()).join("\n");
+        let sql = create_statements(Dialect::Postgres, Dialect::Mysql, "demo", &sample_table())
+            .join("\n");
         assert!(sql.contains("AUTO_INCREMENT"));
         assert!(sql.contains("KEY `idx_name`"));
         assert!(sql.contains("COMMENT='用户表'"));
@@ -798,7 +881,9 @@ mod tests {
         let mut table = sample_table();
         table.columns.push(column(
             "mood",
-            ColumnKind::Enum { labels: vec!["good".into(), "bad".into()] },
+            ColumnKind::Enum {
+                labels: vec!["good".into(), "bad".into()],
+            },
             false,
         ));
         let sql = create_statements(Dialect::Postgres, Dialect::Postgres, "public", &table);
@@ -810,9 +895,16 @@ mod tests {
 
     #[test]
     fn enum_default_cast_is_stripped() {
-        let kind = ColumnKind::Enum { labels: vec!["neutral".into()] };
+        let kind = ColumnKind::Enum {
+            labels: vec!["neutral".into()],
+        };
         assert_eq!(
-            translate_default(Dialect::Postgres, Dialect::Mysql, &kind, Some("'neutral'::mood")),
+            translate_default(
+                Dialect::Postgres,
+                Dialect::Mysql,
+                &kind,
+                Some("'neutral'::mood")
+            ),
             Some("'neutral'".to_string())
         );
     }
@@ -825,11 +917,9 @@ mod tests {
             columns: vec!["bio".to_string()],
             unique: false,
         });
-        table.columns.push(column(
-            "bio",
-            ColumnKind::Text { max_len: None },
-            false,
-        ));
+        table
+            .columns
+            .push(column("bio", ColumnKind::Text { max_len: None }, false));
         let sql = create_statements(Dialect::Postgres, Dialect::Mysql, "demo", &table).join("\n");
         assert!(sql.contains("`bio`(191)"), "{sql}");
         assert!(!sql.contains("`name`(191)"), "{sql}");
@@ -872,7 +962,8 @@ mod tests {
             expression: "lower(name)".to_string(),
             comment: None,
         });
-        let sql = create_statements(Dialect::Postgres, Dialect::Postgres, "public", &table).join("\n");
+        let sql =
+            create_statements(Dialect::Postgres, Dialect::Postgres, "public", &table).join("\n");
         assert!(
             sql.contains("\"lower_name\" text GENERATED ALWAYS AS (lower(name)) STORED"),
             "{sql}"
@@ -882,19 +973,39 @@ mod tests {
     #[test]
     fn pg_defaults_are_translated() {
         assert_eq!(
-            translate_default(Dialect::Postgres, Dialect::Mysql, &ColumnKind::Text { max_len: Some(10) }, Some("'abc'::text")),
+            translate_default(
+                Dialect::Postgres,
+                Dialect::Mysql,
+                &ColumnKind::Text { max_len: Some(10) },
+                Some("'abc'::text")
+            ),
             Some("'abc'".to_string())
         );
         assert_eq!(
-            translate_default(Dialect::Postgres, Dialect::Mysql, &ColumnKind::Bool, Some("true")),
+            translate_default(
+                Dialect::Postgres,
+                Dialect::Mysql,
+                &ColumnKind::Bool,
+                Some("true")
+            ),
             Some("1".to_string())
         );
         assert_eq!(
-            translate_default(Dialect::Postgres, Dialect::Postgres, &ColumnKind::Timestamp, Some("now()")),
+            translate_default(
+                Dialect::Postgres,
+                Dialect::Postgres,
+                &ColumnKind::Timestamp,
+                Some("now()")
+            ),
             Some("CURRENT_TIMESTAMP".to_string())
         );
         assert_eq!(
-            translate_default(Dialect::Mysql, Dialect::Postgres, &ColumnKind::Text { max_len: None }, Some("hello")),
+            translate_default(
+                Dialect::Mysql,
+                Dialect::Postgres,
+                &ColumnKind::Text { max_len: None },
+                Some("hello")
+            ),
             Some("'hello'".to_string())
         );
     }
@@ -910,6 +1021,8 @@ mod tests {
         assert!(same_column_type("DOUBLE PRECISION", "float8"));
         assert!(same_column_type("DECIMAL(10,2)", "numeric(10, 2)"));
         assert!(same_column_type("\"public\".\"mood\"", "mood"));
+        // MariaDB 把 JSON 存成 longtext
+        assert!(same_column_type("JSON", "longtext"));
         assert!(!same_column_type("INT", "bigint"));
         assert!(!same_column_type("VARCHAR(64)", "varchar(128)"));
         assert!(!same_column_type("TIMESTAMP", "timestamp with time zone"));

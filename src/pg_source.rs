@@ -31,7 +31,10 @@ pub async fn connect(url: &str, ns: &str) -> Result<PgSource> {
         .batch_execute("SET TIME ZONE 'UTC'")
         .await
         .context("设置 PostgreSQL 时区失败")?;
-    Ok(PgSource { client, ns: ns.to_string() })
+    Ok(PgSource {
+        client,
+        ns: ns.to_string(),
+    })
 }
 
 /// 搬运专用连接：在导出的快照上开一个只读事务，保证多张表看到同一时间点。
@@ -294,7 +297,11 @@ pub async fn introspect(src: &PgSource, filter: Option<&[String]>) -> Result<Vec
             let cols: Option<Vec<String>> = r.get(2);
             let cols = cols.unwrap_or_default();
             if !cols.is_empty() {
-                indexes.push(Index { name: idx_name, columns: cols, unique });
+                indexes.push(Index {
+                    name: idx_name,
+                    columns: cols,
+                    unique,
+                });
             }
         }
 
@@ -373,7 +380,11 @@ pub async fn pk_bounds(
     if let Some(w) = filter {
         sql.push_str(&format!(" WHERE {w}"));
     }
-    let row = src.client.query_one(&sql, &[]).await.context("读取主键范围失败")?;
+    let row = src
+        .client
+        .query_one(&sql, &[])
+        .await
+        .context("读取主键范围失败")?;
     let lo: Option<i64> = row.get(0);
     let hi: Option<i64> = row.get(1);
     Ok(match (lo, hi) {
@@ -418,7 +429,10 @@ pub async fn views(src: &PgSource, filter: Option<&[String]>) -> Result<Vec<View
         .context("读取 PostgreSQL 视图失败")?;
     Ok(rows
         .iter()
-        .map(|r| View { name: r.get(0), definition: r.get(1) })
+        .map(|r| View {
+            name: r.get(0),
+            definition: r.get(1),
+        })
         .collect())
 }
 
@@ -436,7 +450,10 @@ pub async fn sequences(src: &PgSource, filter: Option<&[String]>) -> Result<Vec<
         let qualified = Dialect::Postgres.qualified(&src.ns, &name);
         let row = src
             .client
-            .query_one(&format!("SELECT last_value, is_called FROM {qualified}"), &[])
+            .query_one(
+                &format!("SELECT last_value, is_called FROM {qualified}"),
+                &[],
+            )
             .await
             .with_context(|| format!("读取序列 {name} 当前值失败"))?;
         let last_value: i64 = row.get(0);
@@ -461,7 +478,11 @@ pub async fn count(src: &PgSource, table: &Table) -> Result<i64> {
         "SELECT count(*)::bigint FROM {}",
         Dialect::Postgres.qualified(&src.ns, &table.name)
     );
-    let row = src.client.query_one(&sql, &[]).await.context("PostgreSQL 统计行数失败")?;
+    let row = src
+        .client
+        .query_one(&sql, &[])
+        .await
+        .context("PostgreSQL 统计行数失败")?;
     Ok(row.get(0))
 }
 
@@ -470,7 +491,11 @@ pub async fn count(src: &PgSource, table: &Table) -> Result<i64> {
 /// 在文本比较下不相等，会让边界行每轮被重复读取。
 pub async fn max_text(src: &PgSource, table: &Table, column: &str) -> Result<Option<String>> {
     let c = Dialect::Postgres.quote(column);
-    let kind = table.columns.iter().find(|col| col.name == column).map(|col| &col.kind);
+    let kind = table
+        .columns
+        .iter()
+        .find(|col| col.name == column)
+        .map(|col| &col.kind);
     let expr = match kind {
         Some(ColumnKind::TimestampTz) => {
             format!("to_char(max({c}) AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US')")
@@ -484,11 +509,16 @@ pub async fn max_text(src: &PgSource, table: &Table, column: &str) -> Result<Opt
         "SELECT {expr} FROM {}",
         Dialect::Postgres.qualified(&src.ns, &table.name)
     );
-    let row = src.client.query_one(&sql, &[]).await.context("读取水位最大值失败")?;
+    let row = src
+        .client
+        .query_one(&sql, &[])
+        .await
+        .context("读取水位最大值失败")?;
     Ok(row.get(0))
 }
 
 /// 把一张表流式读出来，按批交给目标写入。
+#[allow(clippy::too_many_arguments)]
 pub async fn copy_table(
     src: &PgSource,
     table: &Table,
@@ -527,19 +557,19 @@ pub async fn copy_table(
             conditions.push(format!("({w})"));
         }
     }
-    if let Some(f) = filter {
-        if let Some(col) = table.columns.iter().find(|c| c.name == f.column) {
-            let n = params_owned.len() + 1;
-            conditions.push(filter_condition(col, &format!("${n}")));
-            params_owned.push(f.after.clone());
-        }
+    if let Some(f) = filter
+        && let Some(col) = table.columns.iter().find(|c| c.name == f.column)
+    {
+        let n = params_owned.len() + 1;
+        conditions.push(filter_condition(col, &format!("${n}")));
+        params_owned.push(f.after.clone());
     }
-    if let (Some(r), Some(idx)) = (resume, resume_idx) {
-        if let Some(after) = &r.after {
-            let n = params_owned.len() + 1;
-            conditions.push(filter_condition(&table.columns[idx], &format!("${n}")));
-            params_owned.push(after.clone());
-        }
+    if let (Some(r), Some(idx)) = (resume, resume_idx)
+        && let Some(after) = &r.after
+    {
+        let n = params_owned.len() + 1;
+        conditions.push(filter_condition(&table.columns[idx], &format!("${n}")));
+        params_owned.push(after.clone());
     }
     if !conditions.is_empty() {
         sql.push_str(" WHERE ");
@@ -573,8 +603,10 @@ pub async fn copy_table(
         sql.push_str(&format!(" ORDER BY {order}"));
     }
 
-    let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-        params_owned.iter().map(|s| s as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
+    let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params_owned
+        .iter()
+        .map(|s| s as &(dyn tokio_postgres::types::ToSql + Sync))
+        .collect();
     let stream = src
         .client
         .query_raw(&sql, params)
@@ -591,10 +623,10 @@ pub async fn copy_table(
         for (idx, col) in table.columns.iter().enumerate() {
             let text: Option<String> = row.try_get(idx)?;
             let value = pg_value(&col.kind, target, text)?;
-            if Some(col.name.as_str()) == watermark {
-                if let Some(t) = value.as_text() {
-                    stat.last_key = Some(t.to_string());
-                }
+            if Some(col.name.as_str()) == watermark
+                && let Some(t) = value.as_text()
+            {
+                stat.last_key = Some(t.to_string());
             }
             values.push(value);
         }
@@ -622,7 +654,11 @@ fn report_progress(
     let (Some(idx), Some(r)) = (pk_idx, resume) else {
         return;
     };
-    if let Some(key) = batch.last().and_then(|row| row.get(idx)).and_then(|v| v.as_text()) {
+    if let Some(key) = batch
+        .last()
+        .and_then(|row| row.get(idx))
+        .and_then(|v| v.as_text())
+    {
         *last = Some(key.to_string());
     }
     if let (Some(key), Some(cb)) = (last.as_deref(), &r.on_progress) {
@@ -658,7 +694,9 @@ fn pg_value(kind: &ColumnKind, target: Dialect, text: Option<String>) -> Result<
     match kind {
         ColumnKind::Bytes => {
             let hex_text = text.trim_start_matches("\\x");
-            Ok(Value::Bytes(hex::decode(hex_text).context("bytea 十六进制解码失败")?))
+            Ok(Value::Bytes(
+                hex::decode(hex_text).context("bytea 十六进制解码失败")?,
+            ))
         }
         // MySQL 没有数组类型，落成 JSON 文本
         ColumnKind::Array { elem } if target == Dialect::Mysql => {

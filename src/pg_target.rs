@@ -37,12 +37,20 @@ pub async fn connect(url: &str, ns: &str) -> Result<PgTarget> {
             Dialect::Postgres.quote(ns)
         ))
         .await;
-    Ok(PgTarget { client, ns: ns.to_string(), stmts: HashMap::new() })
+    Ok(PgTarget {
+        client,
+        ns: ns.to_string(),
+        stmts: HashMap::new(),
+    })
 }
 
 /// 执行一条（可含多个语句的）SQL。
 pub async fn exec(target: &PgTarget, sql: &str) -> Result<()> {
-    target.client.batch_execute(sql).await.with_context(|| format!("执行 SQL 失败: {sql}"))
+    target
+        .client
+        .batch_execute(sql)
+        .await
+        .with_context(|| format!("执行 SQL 失败: {sql}"))
 }
 
 /// 摘掉目标库里这些表上的外键（TRUNCATE / 重建外键前都要先做），失败忽略。
@@ -68,7 +76,11 @@ pub async fn count(target: &PgTarget, table: &Table) -> Result<i64> {
         "SELECT count(*)::bigint FROM {}",
         Dialect::Postgres.qualified(&target.ns, &table.name)
     );
-    let row = target.client.query_one(&sql, &[]).await.context("目标 PostgreSQL 统计行数失败")?;
+    let row = target
+        .client
+        .query_one(&sql, &[])
+        .await
+        .context("目标 PostgreSQL 统计行数失败")?;
     Ok(row.get(0))
 }
 
@@ -148,10 +160,8 @@ pub async fn write_batch(
         return Ok(0);
     }
     let ncols = table.columns.len().max(1);
-    // PG 扩展协议最多 65535 个参数
-    let max_rows = (60000 / ncols).max(1);
     let mut total = 0;
-    for chunk in rows.chunks(max_rows) {
+    for chunk in rows.chunks(super::sink::rows_per_statement(ncols)) {
         total += write_chunk(target, table, chunk, upsert).await?;
     }
     Ok(total)
@@ -271,7 +281,11 @@ pub async fn column_states(target: &PgTarget, table: &Table) -> Result<Vec<Colum
         .with_context(|| format!("读取目标 {} 的列定义失败", table.name))?;
     Ok(rows
         .iter()
-        .map(|r| ColumnState { name: r.get(0), data_type: r.get(1), not_null: r.get(2) })
+        .map(|r| ColumnState {
+            name: r.get(0),
+            data_type: r.get(1),
+            not_null: r.get(2),
+        })
         .collect())
 }
 
@@ -295,7 +309,9 @@ pub async fn delete_by_pk(target: &PgTarget, table: &Table, pk: &[Value]) -> Res
     let mut params: Vec<Option<String>> = Vec::new();
     for (i, name) in table.primary_key.iter().enumerate() {
         let Some(value) = pk.get(i) else { continue };
-        let Some(col) = table.columns.iter().find(|c| c.name == *name) else { continue };
+        let Some(col) = table.columns.iter().find(|c| c.name == *name) else {
+            continue;
+        };
         let ty = ddl::pg_column_type(&target.ns, &table.name, col);
         conds.push(format!(
             "{} = ${}::text::{ty}",

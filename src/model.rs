@@ -272,8 +272,11 @@ pub struct RowResume {
     /// 上次中断时的位置，None 表示从头开始
     pub after: Option<String>,
     /// 进度回报（主键文本值），由调用方负责落盘
-    pub on_progress: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
+    pub on_progress: Option<ProgressFn>,
 }
+
+/// 进度回调：拿到当前批的最大主键文本值。
+pub type ProgressFn = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
 
 impl std::fmt::Debug for RowResume {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -317,6 +320,9 @@ mod tests {
         let url = "postgres://db:5432/prod";
         assert_eq!(inject_password(url, "other"), url);
         // 不是 URL
-        assert_eq!(inject_password("host=db user=app", "other"), "host=db user=app");
+        assert_eq!(
+            inject_password("host=db user=app", "other"),
+            "host=db user=app"
+        );
     }
 }

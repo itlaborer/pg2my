@@ -17,9 +17,16 @@ pub fn pg_array_to_json(text: &str, elem: &ColumnKind) -> String {
         s
     };
     let chars: Vec<char> = s.chars().collect();
-    let mut parser = Parser { chars: &chars, pos: 0 };
+    let mut parser = Parser {
+        chars: &chars,
+        pos: 0,
+    };
     let out = parser.array(elem);
-    if parser.pos == 0 { "[]".to_string() } else { out }
+    if parser.pos == 0 {
+        "[]".to_string()
+    } else {
+        out
+    }
 }
 
 struct Parser<'a> {
@@ -133,7 +140,11 @@ fn json_scalar(elem: &ColumnKind, raw: &str) -> String {
         | ColumnKind::Real
         | ColumnKind::Double
         | ColumnKind::Numeric { .. } => {
-            if raw.parse::<f64>().is_ok() { raw.to_string() } else { json_string(raw) }
+            if raw.parse::<f64>().is_ok() {
+                raw.to_string()
+            } else {
+                json_string(raw)
+            }
         }
         // 即使原数组里带引号，数字/布尔也按语义还原
         _ => json_string(raw),
@@ -176,7 +187,10 @@ mod tests {
     #[test]
     fn text_array_with_quotes() {
         assert_eq!(
-            pg_array_to_json(r#"{"a,b","say \"hi\""}"#, &ColumnKind::Text { max_len: None }),
+            pg_array_to_json(
+                r#"{"a,b","say \"hi\""}"#,
+                &ColumnKind::Text { max_len: None }
+            ),
             r#"["a,b","say \"hi\""]"#
         );
     }
@@ -191,7 +205,9 @@ mod tests {
 
     #[test]
     fn nested_array() {
-        let elem = ColumnKind::Array { elem: Box::new(ColumnKind::Int) };
+        let elem = ColumnKind::Array {
+            elem: Box::new(ColumnKind::Int),
+        };
         assert_eq!(pg_array_to_json("{{1,2},{3,4}}", &elem), "[[1,2],[3,4]]");
     }
 

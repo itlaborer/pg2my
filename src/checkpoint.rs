@@ -45,16 +45,15 @@ impl Checkpoint {
 
     /// 原子写入：先写临时文件再改名，避免中断留下半个文件。
     pub fn save(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)?;
         }
         let tmp = path.with_extension("tmp");
         fs::write(&tmp, serde_json::to_vec_pretty(self)?)
             .with_context(|| format!("写入断点文件 {} 失败", tmp.display()))?;
-        fs::rename(&tmp, path)
-            .with_context(|| format!("更新断点文件 {} 失败", path.display()))?;
+        fs::rename(&tmp, path).with_context(|| format!("更新断点文件 {} 失败", path.display()))?;
         Ok(())
     }
 

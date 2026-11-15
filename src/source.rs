@@ -2,7 +2,9 @@
 
 use anyhow::{Result, bail};
 
-use crate::model::{CopyStat, Dialect, Endpoint, IncrementalFilter, RowResume, Sequence, Table, View};
+use crate::model::{
+    CopyStat, Dialect, Endpoint, IncrementalFilter, RowResume, Sequence, Table, View,
+};
 use crate::sink::Sink;
 use crate::{my_source, pg_direct, pg_source};
 
@@ -47,6 +49,8 @@ impl Source {
         }
     }
 
+    // 参数是整表搬运的完整选项，拆成结构体会让每个调用点更啰嗦
+    #[allow(clippy::too_many_arguments)]
     pub async fn copy(
         &mut self,
         table: &Table,

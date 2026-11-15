@@ -64,7 +64,8 @@ fn supports_upsert_alias(version: &str) -> bool {
 }
 
 pub async fn exec(target: &mut MyTarget, sql: &str) -> Result<()> {
-    target.conn
+    target
+        .conn
         .query_drop(sql)
         .await
         .with_context(|| format!("执行 SQL 失败: {sql}"))
@@ -111,7 +112,11 @@ pub async fn count(target: &mut MyTarget, table: &Table) -> Result<i64> {
         "SELECT count(*) FROM {}",
         Dialect::Mysql.qualified(&target.db, &table.name)
     );
-    let value: Option<i64> = target.conn.query_first(sql).await.context("目标 MySQL 统计行数失败")?;
+    let value: Option<i64> = target
+        .conn
+        .query_first(sql)
+        .await
+        .context("目标 MySQL 统计行数失败")?;
     Ok(value.unwrap_or(0))
 }
 
@@ -125,10 +130,8 @@ pub async fn write_batch(
         return Ok(0);
     }
     let ncols = table.columns.len().max(1);
-    // MySQL 预处理语句最多 65535 个参数
-    let max_rows = (60000 / ncols).max(1);
     let mut total = 0;
-    for chunk in rows.chunks(max_rows) {
+    for chunk in rows.chunks(super::sink::rows_per_statement(ncols)) {
         total += write_chunk(target, table, chunk, upsert).await?;
     }
     Ok(total)
@@ -178,10 +181,7 @@ async fn write_chunk(
                 sql.push_str(&format!(" ON DUPLICATE KEY UPDATE {q} = {q}"));
             }
         } else {
-            sql.push_str(&format!(
-                " ON DUPLICATE KEY UPDATE {}",
-                updates.join(", ")
-            ));
+            sql.push_str(&format!(" ON DUPLICATE KEY UPDATE {}", updates.join(", ")));
         }
     }
 
