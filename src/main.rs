@@ -6,6 +6,7 @@
 mod binlog_cdc;
 mod cdc;
 mod checkpoint;
+mod csv_io;
 mod ddl;
 mod model;
 mod my_source;
@@ -39,13 +40,13 @@ use crate::source::Source;
     about = "PostgreSQL / MySQL 之间的结构与数据迁移：pg→pg、mysql→mysql、pg→mysql、mysql→pg"
 )]
 struct Cli {
-    /// 源连接串：postgres://... 或 mysql://...
+    /// 源连接串：postgres://... 或 mysql://...（迁移与导出需要）
     #[arg(long, value_name = "URL")]
-    source: String,
+    source: Option<String>,
 
-    /// 目标连接串：postgres://... 或 mysql://...
+    /// 目标连接串：postgres://... 或 mysql://...（迁移与导入需要）
     #[arg(long, value_name = "URL")]
-    target: String,
+    target: Option<String>,
 
     /// 源命名空间（PG schema / MySQL 库名）。PG 默认 public，MySQL 取 URL 里的库名
     #[arg(long)]
@@ -126,6 +127,22 @@ struct Cli {
     /// 增量同步轮询间隔（秒）
     #[arg(long, default_value_t = 5)]
     cdc_interval: u64,
+
+    /// 导出模式：按自定义 SQL 把结果写成 CSV（纯客户端，不依赖服务端文件权限）
+    #[arg(long = "export-sql", value_name = "SQL")]
+    export_sql: Option<String>,
+
+    /// 导出目标文件，需配合 --export-sql
+    #[arg(long = "export-csv", value_name = "FILE")]
+    export_csv: Option<PathBuf>,
+
+    /// 导入模式：把本地 CSV 批量 INSERT 到 --import-table 指定的表
+    #[arg(long = "import-csv", value_name = "FILE")]
+    import_csv: Option<PathBuf>,
+
+    /// 导入的目标表名，需配合 --import-csv
+    #[arg(long = "import-table", value_name = "TABLE")]
+    import_table: Option<String>,
 }
 
 #[tokio::main]
@@ -134,37 +151,53 @@ async fn main() -> Result<()> {
     if cli.parallel == 0 {
         bail!("--parallel 至少为 1");
     }
+    // CSV 导出/导入是独立模式：不建表、不整库搬运，处理完直接退出
+    if cli.export_sql.is_some()
+        || cli.export_csv.is_some()
+        || cli.import_csv.is_some()
+        || cli.import_table.is_some()
+    {
+        return run_csv_modes(&cli).await;
+    }
     if cli.resume && cli.checkpoint.is_none() {
         bail!("--resume 需要配合 --checkpoint <路径> 使用");
     }
     let use_binlog = cli.cdc && cli.cdc_mode == "binlog";
 
-    let src_dialect = Dialect::detect(&cli.source)?;
-    let dst_dialect = Dialect::detect(&cli.target)?;
+    let source = cli
+        .source
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("迁移需要 --source 连接串"))?;
+    let target = cli
+        .target
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("迁移需要 --target 连接串"))?;
+    let src_dialect = Dialect::detect(source)?;
+    let dst_dialect = Dialect::detect(target)?;
     let src_ns = match &cli.schema {
         Some(s) => s.clone(),
         None => match src_dialect {
             Dialect::Postgres => "public".to_string(),
-            Dialect::Mysql => mysql_db(&cli.source)?,
+            Dialect::Mysql => mysql_db(source)?,
         },
     };
     let dst_ns = match &cli.db {
         Some(s) => s.clone(),
         None => match dst_dialect {
             // MySQL 目标优先用连接串里的库名
-            Dialect::Mysql => mysql_db(&cli.target).unwrap_or_else(|_| src_ns.clone()),
+            Dialect::Mysql => mysql_db(target).unwrap_or_else(|_| src_ns.clone()),
             Dialect::Postgres => src_ns.clone(),
         },
     };
 
     let src_ep = Endpoint {
         dialect: src_dialect,
-        url: apply_env_password(&cli.source, src_dialect),
+        url: apply_env_password(source, src_dialect),
         namespace: src_ns.clone(),
     };
     let dst_ep = Endpoint {
         dialect: dst_dialect,
-        url: apply_env_password(&cli.target, dst_dialect),
+        url: apply_env_password(target, dst_dialect),
         namespace: dst_ns.clone(),
     };
 
@@ -750,6 +783,59 @@ async fn main() -> Result<()> {
             )
             .await?;
         }
+    }
+    Ok(())
+}
+
+/// CSV 导出/导入模式：两个操作都指定时先导出再导入。
+async fn run_csv_modes(cli: &Cli) -> Result<()> {
+    match (&cli.export_sql, &cli.export_csv) {
+        (Some(sql), Some(path)) => {
+            let url = cli
+                .source
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("导出需要 --source 连接串"))?;
+            let dialect = Dialect::detect(url)?;
+            let url = apply_env_password(url, dialect);
+            let rows = csv_io::export(&url, dialect, cli.schema.as_deref(), sql, path).await?;
+            println!("已导出 {rows} 行到 {}", path.display());
+        }
+        (Some(_), None) => bail!("--export-sql 需要配合 --export-csv <文件> 使用"),
+        (None, Some(_)) => bail!("--export-csv 需要配合 --export-sql \"<SQL>\" 使用"),
+        (None, None) => {}
+    }
+
+    match (&cli.import_csv, &cli.import_table) {
+        (Some(path), Some(table)) => {
+            let url = cli
+                .target
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("导入需要 --target 连接串"))?;
+            let dialect = Dialect::detect(url)?;
+            let url = apply_env_password(url, dialect);
+            // 目标命名空间：--db 优先，PG 退回 --schema，MySQL 再退回连接串里的库名
+            let ns = match dialect {
+                Dialect::Postgres => cli
+                    .db
+                    .clone()
+                    .or_else(|| cli.schema.clone())
+                    .unwrap_or_else(|| "public".to_string()),
+                Dialect::Mysql => match cli.db.clone().or_else(|| cli.schema.clone()) {
+                    Some(ns) => ns,
+                    None => mysql_db(&url)?,
+                },
+            };
+            let ep = Endpoint {
+                dialect,
+                url,
+                namespace: ns.clone(),
+            };
+            let rows = csv_io::import(&ep, table, path, cli.batch_size, cli.truncate).await?;
+            println!("已导入 {rows} 行到 {}.{}", ns, table);
+        }
+        (Some(_), None) => bail!("--import-csv 需要配合 --import-table <表名> 使用"),
+        (None, Some(_)) => bail!("--import-table 需要配合 --import-csv <文件> 使用"),
+        (None, None) => {}
     }
     Ok(())
 }

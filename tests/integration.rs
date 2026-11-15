@@ -1,4 +1,4 @@
-//! 端到端集成测试：对真实 PostgreSQL / MySQL 跑四种迁移方向。
+//! 端到端集成测试：对真实 PostgreSQL / MySQL 跑四种迁移方向与 CSV 导出/导入。
 //!
 //! 需要两个可建库的连接串，否则自动跳过（CI 里由 services 提供）：
 //!   PG2MYSQL_IT_PG_URL=postgres://postgres@127.0.0.1:5432/postgres
@@ -239,4 +239,105 @@ async fn four_directions_roundtrip() {
         .await,
         (ROWS, non_null, 1)
     );
+}
+
+/// CSV 导出/导入：验证 NULL 与空串、逗号、双引号、换行能跨方言原样往返。
+#[tokio::test]
+async fn csv_export_import_roundtrip() {
+    let (Ok(pg_url), Ok(my_url)) = (
+        std::env::var("PG2MYSQL_IT_PG_URL"),
+        std::env::var("PG2MYSQL_IT_MYSQL_URL"),
+    ) else {
+        eprintln!("跳过集成测试：未设置 PG2MYSQL_IT_PG_URL / PG2MYSQL_IT_MYSQL_URL");
+        return;
+    };
+
+    const CSV_PG: &str = "it_csv_pg";
+    const CSV_MY: &str = "it_csv_my";
+    pg_exec(&pg_url, &format!("DROP DATABASE IF EXISTS {CSV_PG}")).await;
+    pg_exec(&pg_url, &format!("CREATE DATABASE {CSV_PG}")).await;
+    my_exec(&my_url, &format!("DROP DATABASE IF EXISTS {CSV_MY}")).await;
+    my_exec(&my_url, &format!("CREATE DATABASE {CSV_MY}")).await;
+
+    let csv_pg = with_db(&pg_url, CSV_PG);
+    let csv_my = with_db(&my_url, CSV_MY);
+
+    pg_exec(
+        &csv_pg,
+        "CREATE TABLE it_csv (id int PRIMARY KEY, name text, note text);
+         CREATE TABLE it_csv_back (id int PRIMARY KEY, name text, note text);
+         INSERT INTO it_csv VALUES
+           (1, NULL, NULL),
+           (2, '', ''),
+           (3, 'a,b', 'say \"hi\"'),
+           (4, E'x\ny', NULL);",
+    )
+    .await;
+    my_exec(
+        &csv_my,
+        "CREATE TABLE it_csv (id int PRIMARY KEY, name text, note text);
+         CREATE TABLE it_csv_back (id int PRIMARY KEY, name text, note text);",
+    )
+    .await;
+
+    let file = std::env::temp_dir().join(format!("pg2mysql-it-{}.csv", std::process::id()));
+    let file_str = file.to_string_lossy().to_string();
+
+    // PG 导出 → MySQL 导入：NULL 不算非空，空串算非空
+    run(&[
+        "--source",
+        &csv_pg,
+        "--export-sql",
+        "select id, name, note from it_csv order by id",
+        "--export-csv",
+        &file_str,
+    ])
+    .await;
+    run(&[
+        "--target",
+        &csv_my,
+        "--import-csv",
+        &file_str,
+        "--import-table",
+        "it_csv",
+    ])
+    .await;
+    assert_eq!(
+        my_query(&csv_my, "SELECT count(*), count(note) FROM it_csv").await,
+        (4, 2)
+    );
+    assert_eq!(
+        my_query(&csv_my, "SELECT count(*), count(name) FROM it_csv").await,
+        (4, 3)
+    );
+
+    // MySQL 导出 → PG 导入
+    run(&[
+        "--source",
+        &csv_my,
+        "--export-sql",
+        "select id, name, note from it_csv order by id",
+        "--export-csv",
+        &file_str,
+    ])
+    .await;
+    run(&[
+        "--target",
+        &csv_pg,
+        "--import-csv",
+        &file_str,
+        "--import-table",
+        "it_csv_back",
+    ])
+    .await;
+    assert_eq!(
+        pg_query(
+            &csv_pg,
+            "SELECT count(*), count(name), count(note) FROM it_csv_back"
+        )
+        .await,
+        (4, 3, 2)
+    );
+
+    let _ = std::fs::remove_file(&file);
 }

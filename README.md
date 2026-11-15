@@ -14,6 +14,7 @@
 - **并行搬运**：`--parallel` 按表并行，每个任务独立连接
 - **单表分片**：`--shards N` 按整数主键范围把一张大表拆成 N 片并发搬运（PG 源共享同一快照）
 - **PG COPY 加速**：`--copy` 走 `COPY FROM STDIN`，比多行 INSERT 快约一个量级；PG → PG 时直接 `COPY TO STDOUT` → `COPY FROM STDIN` 字节流直通，不做逐行类型转换
+- **CSV 导出/导入**：托管实例不能读本地文件时，用 `--export-sql` 把任意查询结果写成 CSV，再用 `--import-csv` 批量 INSERT 回目标表，全程只走客户端协议
 - **一致性快照**：PG 用 `pg_export_snapshot()` + REPEATABLE READ，MySQL 用 `START TRANSACTION WITH CONSISTENT SNAPSHOT`，并行任务共享同一快照
 - **行级断点续搬**：`--resume` 按单列主键做 keyset 分页，中断后从上次主键继续，不重不漏
 - **增量同步**：`--cdc` 支持轮询水位与 MySQL binlog（ROW 格式），可捕获 INSERT/UPDATE/DELETE
@@ -190,6 +191,32 @@ pg2mysql --source postgres://app@10.0.0.1:5432/appdb \
 ```
 
 `--where` 对本次选中的所有表生效，列名必须存在。带 `--where` 时不要同时开 `--verify`，因为校验比对的是整表行数。
+
+### CSV 导出 / 导入（托管实例无文件权限时）
+
+云上托管数据库通常不允许 `COPY ... FROM '/本地路径'` 或 `LOAD DATA LOCAL INFILE`。这时拆成两步，全部走普通客户端协议：
+
+```bash
+# 1. 按自定义 SQL 导出（PG 用 COPY TO STDOUT 接收字节流，MySQL 用普通 SELECT）
+pg2mysql \
+  --source postgres://app@rds:5432/appdb \
+  --export-sql "select id,name,email from users where created_at >= '2025-01-01'" \
+  --export-csv /var/tmp/users.csv
+
+# 2. 把本地 CSV 批量 INSERT 到目标库的表
+pg2mysql \
+  --target mysql://app@rds:3306/appdb \
+  --import-csv /var/tmp/users.csv \
+  --import-table users
+```
+
+- 导出只需要 `--source`，导入只需要 `--target`；CSV 模式不会建表、不整库搬运，两个操作同时给出时先导出再导入
+- CSV 约定与 PG 的 `COPY ... CSV` 一致：**NULL 是空字段，空字符串是 `""`**；含逗号、双引号、换行的字段按 RFC 4180 转义；首行是查询结果的列名
+- 导入按表头列名匹配目标表：CSV 里没有的列使用目标表默认值 / 自增，多出来的列会提示并忽略
+- `--schema` 在导出时用于 PG 的 `search_path` 和 MySQL 的 `USE`；导入的目标命名空间用 `--db`，未指定时 MySQL 取连接串里的库名、PG 取 `public`
+- `--truncate` 可在导入前清空目标表，`--batch-size` 控制每批 INSERT 行数
+- PG 布尔列经 `COPY` 导出是 `t` / `f`，跨方言导入请在 SQL 里显式转换，例如 `select ..., flag::int as flag ...`
+- 导出是流式的，不会把整表读进内存；二进制列按文本处理，仅建议用于文本类数据
 
 ### 增量同步
 
