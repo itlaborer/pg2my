@@ -1,0 +1,95 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: 构建 ${{ matrix.artifact }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            artifact: pg2mysql-linux-amd64
+          - target: aarch64-unknown-linux-musl
+            artifact: pg2mysql-linux-arm64
+            zigbuild: true
+          - target: x86_64-pc-windows-gnu
+            artifact: pg2mysql-windows-amd64.exe
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: 安装交叉编译依赖
+        run: |
+          set -euo pipefail
+          case "${{ matrix.target }}" in
+            x86_64-pc-windows-gnu)
+              sudo apt-get update
+              sudo apt-get install -y gcc-mingw-w64-x86-64
+              ;;
+            aarch64-unknown-linux-musl)
+              # zig 自带 musl libc，用于静态链接 ring 的 C 代码
+              python3 -m venv /opt/zigvenv
+              /opt/zigvenv/bin/pip install -q ziglang==0.16.0
+              echo "/opt/zigvenv/bin" >> "$GITHUB_PATH"
+              cargo install cargo-zigbuild
+              ;;
+          esac
+
+      - name: 构建
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.zigbuild }}" = "true" ]; then
+            cargo zigbuild --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+
+      - name: 整理产物
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          BIN="target/${{ matrix.target }}/release/pg2mysql"
+          if [ -f "${BIN}.exe" ]; then BIN="${BIN}.exe"; fi
+          cp "$BIN" "dist/${{ matrix.artifact }}"
+          ls -lh "dist/${{ matrix.artifact }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}
+
+  publish:
+    name: 发布 GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: 生成校验和
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*
+          generate_release_notes: true
