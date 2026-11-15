@@ -6,13 +6,15 @@
 
 - **四种方向**：由 `--source` / `--target` 连接串自动判断，无需额外参数
 - **结构迁移**：表、列、主键、索引、外键、注释、枚举、数组、JSON、生成列、自增/序列
+- **库对象**：同方言迁移视图定义与 PG 独立序列（含当前位点）；跨方言视图会明确提示跳过
+- **结构漂移自愈**：目标表已存在时自动补缺失的列和索引，列类型/非空不一致会提示，加 `--sync-schema` 直接对齐
+- **外键容错**：存量脏数据导致外键建不上时，PG 自动降级为 `NOT VALID`、MySQL 临时关闭 `foreign_key_checks` 重试，不中断迁移
 - **并行搬运**：`--parallel` 按表并行，每个任务独立连接
 - **单表分片**：`--shards N` 按整数主键范围把一张大表拆成 N 片并发搬运（PG 源共享同一快照）
 - **PG COPY 加速**：`--copy` 走 `COPY FROM STDIN`，比多行 INSERT 快约一个量级；PG → PG 时直接 `COPY TO STDOUT` → `COPY FROM STDIN` 字节流直通，不做逐行类型转换
 - **一致性快照**：PG 用 `pg_export_snapshot()` + REPEATABLE READ，MySQL 用 `START TRANSACTION WITH CONSISTENT SNAPSHOT`，并行任务共享同一快照
 - **行级断点续搬**：`--resume` 按单列主键做 keyset 分页，中断后从上次主键继续，不重不漏
 - **增量同步**：`--cdc` 支持轮询水位与 MySQL binlog（ROW 格式），可捕获 INSERT/UPDATE/DELETE
-- **结构漂移自愈**：目标表已存在时自动补缺失的列和索引
 - **安全**：密码可走 `PGPASSWORD` / `MYSQL_PWD`，避免出现在命令行和进程列表
 - **可预演**：`--ddl-only` 只看 DDL，`--dry-run` 输出完整计划且不写目标库
 
@@ -104,6 +106,7 @@ pg2mysql --source postgres://app@10.0.0.1:5432/appdb \
 | `--verify` | 迁移完成后比对行数 | 否 |
 | `--ddl-only` | 只打印目标方言 DDL | 否 |
 | `--dry-run` | 打印 DDL 与数据搬运计划，不连目标库 | 否 |
+| `--sync-schema` | 目标表已存在时把列类型/非空对齐成源定义，默认只打印差异 | 否 |
 | `--where` | 附加到源查询的过滤条件（原始 SQL） | 无 |
 | `--checkpoint` | 断点文件路径（记录已完成表、水位、binlog 位点） | 无 |
 | `--resume` | 跳过已完成表，未完成的按主键续搬 | 否 |
@@ -144,6 +147,21 @@ pg2mysql \
 - 可与 `--where` 叠加，分片条件会与过滤条件取交集
 - 总连接数约为 `--parallel × --shards × 2`（源 + 目标各一条）
 - PG 源各片共享导出快照，跨片时点一致；**MySQL 源各片独立开一致性事务，跨片时点可能不同**，需要严格一致时不要用分片
+
+### 结构漂移对齐与库对象
+
+```bash
+# 目标库是旧结构：先看差异，确认后再加 --sync-schema 对齐
+pg2mysql --source postgres://app@10.0.0.1:5432/appdb \
+         --target postgres://app@10.0.0.3:5432/appdb --tables orders
+pg2mysql --source postgres://app@10.0.0.1:5432/appdb \
+         --target postgres://app@10.0.0.3:5432/appdb --tables orders --sync-schema
+```
+
+- 视图与 PG 独立序列随整库一起迁移（同样受 `--tables` 过滤），只在同方言之间重建，跨方言会提示跳过
+- 视图互相依赖时自动多轮重试；`--sync-schema` 改列类型前会先删除待重建的视图，搬完自动恢复
+- PG 序列位点取源库磁盘上的 `last_value`（含 cache 预留），目标不会重复发出源已分配过的值
+- 枚举等自定义类型的列变更需要人工处理；存量数据违反外键时 PG 建为 `NOT VALID`，事后可 `VALIDATE CONSTRAINT`
 
 ### 只同步部分数据
 

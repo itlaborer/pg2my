@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 
-use crate::model::{Dialect, Endpoint, Table, Value};
+use crate::model::{ColumnState, Dialect, Endpoint, Table, Value};
 use crate::{my_target, pg_target};
 
 pub enum Sink {
@@ -89,6 +89,14 @@ impl Sink {
         match self {
             Sink::Pg(t) => pg_target::existing_columns(t, table).await,
             Sink::My(t) => my_target::existing_columns(t, table).await,
+        }
+    }
+
+    /// 目标表已有列的类型与非空状态，用于结构漂移比对。
+    pub async fn column_states(&mut self, table: &Table) -> Result<Vec<ColumnState>> {
+        match self {
+            Sink::Pg(t) => pg_target::column_states(t, table).await,
+            Sink::My(t) => my_target::column_states(t, table).await,
         }
     }
 

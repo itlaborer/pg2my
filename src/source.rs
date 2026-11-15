@@ -2,7 +2,7 @@
 
 use anyhow::{Result, bail};
 
-use crate::model::{CopyStat, Dialect, Endpoint, IncrementalFilter, RowResume, Table};
+use crate::model::{CopyStat, Dialect, Endpoint, IncrementalFilter, RowResume, Sequence, Table, View};
 use crate::sink::Sink;
 use crate::{my_source, pg_direct, pg_source};
 
@@ -100,6 +100,22 @@ impl Source {
         match (self, sink) {
             (Source::Pg(src), Sink::Pg(dst)) => pg_direct::run(src, dst, table).await,
             _ => bail!("COPY 直通仅支持 PostgreSQL → PostgreSQL"),
+        }
+    }
+
+    /// 普通视图：定义保留源方言，只在同方言之间迁移。
+    pub async fn views(&mut self, filter: Option<&[String]>) -> Result<Vec<View>> {
+        match self {
+            Source::Pg(s) => pg_source::views(s, filter).await,
+            Source::My(s) => my_source::views(s, filter).await,
+        }
+    }
+
+    /// 独立序列（不依附于列）。MySQL 没有序列对象，返回空。
+    pub async fn sequences(&mut self, filter: Option<&[String]>) -> Result<Vec<Sequence>> {
+        match self {
+            Source::Pg(s) => pg_source::sequences(s, filter).await,
+            Source::My(_) => Ok(Vec::new()),
         }
     }
 

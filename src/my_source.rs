@@ -9,7 +9,7 @@ use mysql_async::{
 
 use crate::model::{
     Column, ColumnKind, CopyStat, Dialect, ForeignKey, IncrementalFilter, Index, RowResume, Table,
-    Value,
+    Value, View,
 };
 use crate::sink::Sink;
 use crate::type_map;
@@ -298,6 +298,34 @@ pub async fn pk_bounds(
         (Some(a), Some(b)) => Some((a, b)),
         _ => None,
     })
+}
+
+/// 视图定义保留 MySQL 方言，只在 MySQL → MySQL 时迁移。
+pub async fn views(src: &mut MySource, filter: Option<&[String]>) -> Result<Vec<View>> {
+    let rows: Vec<Row> = src
+        .conn
+        .exec(
+            "SELECT TABLE_NAME, VIEW_DEFINITION FROM information_schema.VIEWS \
+             WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME",
+            (src.ns.as_str(),),
+        )
+        .await
+        .context("读取 MySQL 视图失败")?;
+    let mut out = Vec::new();
+    for row in rows {
+        let name: String = row.get(0).unwrap_or_default();
+        if let Some(f) = filter {
+            if !f.iter().any(|t| t == &name) {
+                continue;
+            }
+        }
+        // 权限不足时 VIEW_DEFINITION 为 NULL，跳过并交给调用方统计
+        let definition: Option<String> = row.get(1);
+        if let Some(definition) = definition.filter(|d| !d.trim().is_empty()) {
+            out.push(View { name, definition });
+        }
+    }
+    Ok(out)
 }
 
 pub async fn count(src: &mut MySource, table: &Table) -> Result<i64> {

@@ -85,6 +85,10 @@ struct Cli {
     #[arg(long)]
     copy: bool,
 
+    /// 目标表已存在时，把列类型/非空同步成源定义（不加该参数只打印差异）
+    #[arg(long)]
+    sync_schema: bool,
+
     /// 只打印目标方言的 DDL，不连目标库
     #[arg(long)]
     ddl_only: bool,
@@ -183,6 +187,13 @@ async fn main() -> Result<()> {
 
     let mut src = Source::connect(&src_ep).await?;
     let mut tables = src.introspect(filter.as_deref()).await?;
+    let views = src.views(filter.as_deref()).await?;
+    // 独立序列只在 PG → PG 时有意义，其它方向不必查询
+    let sequences = if src_dialect == Dialect::Postgres && dst_dialect == Dialect::Postgres {
+        src.sequences(filter.as_deref()).await?
+    } else {
+        Vec::new()
+    };
     drop(src);
 
     // 排除表优先于 --tables
@@ -195,11 +206,17 @@ async fn main() -> Result<()> {
         }
     }
 
-    if tables.is_empty() {
+    if tables.is_empty() && views.is_empty() && sequences.is_empty() {
         println!("源命名空间 {} 下没有找到可迁移的表", src_ns);
         return Ok(());
     }
     println!("共 {} 张表", tables.len());
+    if !views.is_empty() {
+        println!("共 {} 个视图", views.len());
+    }
+    if !sequences.is_empty() {
+        println!("共 {} 个独立序列", sequences.len());
+    }
 
     // MySQL 没有 PG 的导出快照能力，各并行任务各自开一致性事务，跨表时点可能不同
     if src_dialect == Dialect::Mysql && cli.parallel > 1 && tables.len() > 1 && !use_binlog {
@@ -225,6 +242,18 @@ async fn main() -> Result<()> {
                 line.push_str(&format!("  [主键分片 {}]", cli.shards));
             }
             println!("{line}");
+        }
+        for seq in &sequences {
+            for sql in ddl::standalone_sequence_statements(&dst_ns, seq) {
+                println!("-- {sql}");
+            }
+        }
+        for view in &views {
+            if src_dialect == dst_dialect {
+                println!("-- {}", ddl::view_statement(dst_dialect, &dst_ns, view));
+            } else {
+                println!("-- 跳过视图 {}：源方言 SQL 不跨方言重建", view.name);
+            }
         }
         return Ok(());
     }
@@ -274,6 +303,17 @@ async fn main() -> Result<()> {
 
     // 1. 建表（含枚举类型）
     let mut target = Sink::connect(&dst_ep).await?;
+    let mut drift = 0usize;
+    // PG 不允许修改被视图依赖的列类型；--sync-schema 时先删掉这些视图，第 3.2 步会按源定义重建
+    if cli.sync_schema && src_dialect == dst_dialect && !views.is_empty() {
+        for view in &views {
+            let sql = format!(
+                "DROP VIEW IF EXISTS {} CASCADE",
+                dst_dialect.qualified(&dst_ns, &view.name)
+            );
+            target.exec(&sql).await.with_context(|| format!("删除视图 {} 失败", view.name))?;
+        }
+    }
     for table in &tables {
         if dst_dialect == Dialect::Mysql && !table.generated_columns.is_empty() {
             for g in &table.generated_columns {
@@ -309,6 +349,55 @@ async fn main() -> Result<()> {
                     .exec(&sql)
                     .await
                     .with_context(|| format!("补列 {} 失败", table.name))?;
+            }
+        }
+        // 列级漂移：已存在表的列类型/非空是否还符合源定义
+        if !existing.is_empty() {
+            let states = target
+                .column_states(table)
+                .await
+                .with_context(|| format!("读取目标 {} 列定义失败", table.name))?;
+            for col in &table.columns {
+                let Some(st) = states.iter().find(|s| s.name == col.name) else {
+                    continue;
+                };
+                let expected = match dst_dialect {
+                    Dialect::Postgres => ddl::pg_column_type(&dst_ns, &table.name, col),
+                    Dialect::Mysql => type_map::mysql_type(&col.kind),
+                };
+                let type_diff = !ddl::same_column_type(&expected, &st.data_type);
+                let null_diff = col.not_null != st.not_null && !col.auto_increment;
+                if !type_diff && !null_diff {
+                    continue;
+                }
+                if cli.sync_schema {
+                    let sqls = ddl::sync_column_statements(
+                        src_dialect, dst_dialect, &dst_ns, table, col, type_diff, null_diff,
+                    );
+                    if sqls.is_empty() {
+                        println!("  差异 {:<32} {} 自定义类型需人工处理", table.name, col.name);
+                        continue;
+                    }
+                    for sql in sqls {
+                        match target.exec(&sql).await {
+                            Ok(()) => println!("  同步列 {:<32} {}", table.name, col.name),
+                            Err(e) => {
+                                eprintln!("  warn 同步列 {}.{} 失败: {e:#}", table.name, col.name)
+                            }
+                        }
+                    }
+                } else {
+                    drift += 1;
+                    println!(
+                        "  差异 {:<32} {}: 目标 {}{}，期望 {}{}",
+                        table.name,
+                        col.name,
+                        st.data_type,
+                        if st.not_null { " NOT NULL" } else { "" },
+                        expected,
+                        if col.not_null { " NOT NULL" } else { "" }
+                    );
+                }
             }
         }
         // MySQL 的索引内联在建表语句里，旧表需要单独补
@@ -493,13 +582,77 @@ async fn main() -> Result<()> {
         let statements = ddl::index_statements(dst_dialect, &dst_ns, table)
             .into_iter()
             .chain(ddl::comment_statements(dst_dialect, &dst_ns, table))
-            .chain(ddl::foreign_key_statements(dst_dialect, &dst_ns, table))
             .chain(ddl::sequence_statements(dst_dialect, &dst_ns, table));
         for sql in statements {
             if let Err(e) = target.exec(&sql).await {
                 eprintln!("  warn {}: {e}", table.name);
                 warnings += 1;
             }
+        }
+        // 外键单独处理：失败时降级重试，尽量把结构建起来
+        for fk in &table.foreign_keys {
+            match create_foreign_key(&mut target, dst_dialect, &dst_ns, table, fk).await {
+                Ok(true) => println!(
+                    "  提示 {}.{} 外键 {} 未校验存量数据",
+                    dst_ns, table.name, fk.name
+                ),
+                Ok(false) => {}
+                Err(e) => {
+                    eprintln!("  warn {} 外键 {}: {e:#}", table.name, fk.name);
+                    warnings += 1;
+                }
+            }
+        }
+    }
+
+    // 3.1 独立序列：PG → PG 时连同当前位点一起重建
+    for seq in &sequences {
+        for sql in ddl::standalone_sequence_statements(&dst_ns, seq) {
+            if let Err(e) = target.exec(&sql).await {
+                eprintln!("  warn 序列 {}: {e}", seq.name);
+                warnings += 1;
+            }
+        }
+    }
+
+    // 3.2 视图：定义是源方言 SQL，只同方言重建；视图之间可能互相依赖，
+    // 因此每轮把成功的剔除后重试，直到一轮没有任何进展。
+    if !views.is_empty() && src_dialect != dst_dialect {
+        println!(
+            "跳过 {} 个视图：视图定义是 {} 方言 SQL，跨方言不自动重建",
+            views.len(),
+            src_dialect.label()
+        );
+    } else if !views.is_empty() {
+        let mut pending = views.clone();
+        let mut errors: std::collections::HashMap<String, String> = Default::default();
+        loop {
+            let mut progressed = false;
+            let mut next = Vec::new();
+            for view in pending {
+                let sql = ddl::view_statement(dst_dialect, &dst_ns, &view);
+                match target.exec(&sql).await {
+                    Ok(()) => {
+                        println!("  视图 {:<32} 已创建", view.name);
+                        errors.remove(&view.name);
+                        progressed = true;
+                    }
+                    Err(e) => {
+                        errors.insert(view.name.clone(), format!("{e:#}"));
+                        next.push(view);
+                    }
+                }
+            }
+            if next.is_empty() || !progressed {
+                pending = next;
+                break;
+            }
+            pending = next;
+        }
+        for view in pending {
+            let reason = errors.get(&view.name).cloned().unwrap_or_default();
+            eprintln!("  warn 视图 {}: {reason}", view.name);
+            warnings += 1;
         }
     }
 
@@ -522,6 +675,9 @@ async fn main() -> Result<()> {
     println!("\n全量迁移完成，耗时 {:.1}s", started.elapsed().as_secs_f64());
     if warnings > 0 {
         println!("有 {warnings} 条补充 DDL 未成功（见上方 warn）");
+    }
+    if drift > 0 {
+        println!("有 {drift} 处列定义与源不一致，可加 --sync-schema 同步");
     }
     if !failed.is_empty() {
         bail!("{} 张表迁移失败: {}", failed.len(), failed.join(", "));
@@ -558,6 +714,42 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// 建外键，失败时降级重试一次：PG 改 NOT VALID，MySQL 会话级关掉 foreign_key_checks。
+/// 返回 Ok(true) 表示走了降级路径（存量数据未被校验）。
+async fn create_foreign_key(
+    target: &mut Sink,
+    dialect: Dialect,
+    ns: &str,
+    table: &Table,
+    fk: &crate::model::ForeignKey,
+) -> Result<bool> {
+    let Some(sql) = ddl::foreign_key_statement(dialect, ns, table, fk, false) else {
+        return Ok(false);
+    };
+    match target.exec(&sql).await {
+        Ok(()) => Ok(false),
+        Err(first) => {
+            let retried = match dialect {
+                Dialect::Postgres => {
+                    let lenient = ddl::foreign_key_statement(dialect, ns, table, fk, true)
+                        .expect("同一条外键必定能生成 SQL");
+                    target.exec(&lenient).await
+                }
+                Dialect::Mysql => {
+                    target.exec("SET FOREIGN_KEY_CHECKS=0").await?;
+                    let r = target.exec(&sql).await;
+                    target.exec("SET FOREIGN_KEY_CHECKS=1").await?;
+                    r
+                }
+            };
+            match retried {
+                Ok(()) => Ok(true),
+                Err(e) => Err(e.context(format!("首次执行也失败: {first:#}"))),
+            }
+        }
+    }
 }
 
 /// 构造行级断点：仅 `--resume` 且单列主键时启用，进度最多每秒落盘一次。

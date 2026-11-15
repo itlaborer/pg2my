@@ -209,6 +209,38 @@ pub struct Table {
     pub comment: Option<String>,
 }
 
+/// 目标库现有列的状态，用于结构漂移比对。
+#[derive(Debug, Clone)]
+pub struct ColumnState {
+    pub name: String,
+    /// 目标方言的类型文本（PG 来自 format_type，MySQL 来自 COLUMN_TYPE）
+    pub data_type: String,
+    pub not_null: bool,
+}
+
+/// 普通视图。定义保留源方言 SQL，只在同方言之间迁移。
+#[derive(Debug, Clone)]
+pub struct View {
+    pub name: String,
+    /// `CREATE VIEW ... AS` 之后的查询主体
+    pub definition: String,
+}
+
+/// 独立序列（不依附于任何列），PG 专用。
+#[derive(Debug, Clone)]
+pub struct Sequence {
+    pub name: String,
+    pub increment: i64,
+    pub min_value: i64,
+    pub max_value: i64,
+    pub start: i64,
+    pub cache: i64,
+    pub cycle: bool,
+    /// 源库当前位点；空序列（从未 nextval）时为 None
+    pub last_value: Option<i64>,
+    pub is_called: bool,
+}
+
 /// 搬运过程中的统一值表示。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {

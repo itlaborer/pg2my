@@ -8,7 +8,7 @@ use tokio_postgres::{Client, NoTls};
 
 use crate::model::{
     Column, ColumnKind, CopyStat, Dialect, ForeignKey, GeneratedColumn, IncrementalFilter, Index,
-    RowResume, Table, Value,
+    RowResume, Sequence, Table, Value, View,
 };
 use crate::sink::Sink;
 use crate::type_map;
@@ -380,6 +380,80 @@ pub async fn pk_bounds(
         (Some(a), Some(b)) => Some((a, b)),
         _ => None,
     })
+}
+
+/// 普通视图定义。物化视图（relkind='m'）带数据，不在此列。
+const VIEWS_SQL: &str = r#"
+SELECT c.relname::text, pg_get_viewdef(c.oid, true)
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relkind = 'v'
+  AND n.nspname = $1
+  AND ($2::text[] IS NULL OR c.relname = ANY($2))
+ORDER BY c.relname
+"#;
+
+/// 独立序列：deptype='a'/'i' 的序列归列所有，建表时已随 serial/identity 处理。
+const SEQUENCES_SQL: &str = r#"
+SELECT c.relname::text, s.seqincrement, s.seqmin, s.seqmax, s.seqstart, s.seqcache, s.seqcycle
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+JOIN pg_sequence s ON s.seqrelid = c.oid
+WHERE c.relkind = 'S'
+  AND n.nspname = $1
+  AND ($2::text[] IS NULL OR c.relname = ANY($2))
+  AND NOT EXISTS (
+      SELECT 1 FROM pg_depend d
+      WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid AND d.deptype IN ('a', 'i')
+  )
+ORDER BY c.relname
+"#;
+
+pub async fn views(src: &PgSource, filter: Option<&[String]>) -> Result<Vec<View>> {
+    let filter: Option<Vec<String>> = filter.map(|f| f.to_vec());
+    let rows = src
+        .client
+        .query(VIEWS_SQL, &[&src.ns, &filter])
+        .await
+        .context("读取 PostgreSQL 视图失败")?;
+    Ok(rows
+        .iter()
+        .map(|r| View { name: r.get(0), definition: r.get(1) })
+        .collect())
+}
+
+pub async fn sequences(src: &PgSource, filter: Option<&[String]>) -> Result<Vec<Sequence>> {
+    let filter: Option<Vec<String>> = filter.map(|f| f.to_vec());
+    let rows = src
+        .client
+        .query(SEQUENCES_SQL, &[&src.ns, &filter])
+        .await
+        .context("读取 PostgreSQL 序列失败")?;
+    let mut out = Vec::with_capacity(rows.len());
+    for r in rows {
+        let name: String = r.get(0);
+        // 当前位点必须直接读序列本身，pg_sequences.last_value 受权限与快照影响
+        let qualified = Dialect::Postgres.qualified(&src.ns, &name);
+        let row = src
+            .client
+            .query_one(&format!("SELECT last_value, is_called FROM {qualified}"), &[])
+            .await
+            .with_context(|| format!("读取序列 {name} 当前值失败"))?;
+        let last_value: i64 = row.get(0);
+        let is_called: bool = row.get(1);
+        out.push(Sequence {
+            name,
+            increment: r.get(1),
+            min_value: r.get(2),
+            max_value: r.get(3),
+            start: r.get(4),
+            cache: r.get(5),
+            cycle: r.get(6),
+            last_value: is_called.then_some(last_value),
+            is_called,
+        });
+    }
+    Ok(out)
 }
 
 pub async fn count(src: &PgSource, table: &Table) -> Result<i64> {

@@ -6,7 +6,7 @@ use mysql_async::{
 };
 use std::collections::HashMap;
 
-use crate::model::{Dialect, Table, Value};
+use crate::model::{ColumnState, Dialect, Table, Value};
 
 pub struct MyTarget {
     pub conn: Conn,
@@ -230,6 +230,33 @@ pub async fn existing_columns(target: &mut MyTarget, table: &Table) -> Result<Ve
         .await
         .with_context(|| format!("读取目标 {} 的列失败", table.name))?;
     Ok(rows.iter().filter_map(|r| r.get::<String, _>(0)).collect())
+}
+
+/// 目标列的类型与非空状态，供结构漂移比对。
+pub async fn column_states(target: &mut MyTarget, table: &Table) -> Result<Vec<ColumnState>> {
+    let params = Params::Positional(vec![
+        MyValue::from(target.db.clone()),
+        MyValue::from(table.name.clone()),
+    ]);
+    let rows: Vec<mysql_async::Row> = target
+        .conn
+        .exec(
+            "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+            params,
+        )
+        .await
+        .with_context(|| format!("读取目标 {} 的列定义失败", table.name))?;
+    Ok(rows
+        .iter()
+        .filter_map(|r| {
+            Some(ColumnState {
+                name: r.get::<String, _>(0)?,
+                data_type: r.get::<String, _>(1).unwrap_or_default(),
+                not_null: r.get::<String, _>(2).unwrap_or_default() == "NO",
+            })
+        })
+        .collect())
 }
 
 /// 目标表已有索引名（含主键），用于只补缺失索引。

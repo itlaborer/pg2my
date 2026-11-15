@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use tokio_postgres::{Client, NoTls, Statement};
 
 use crate::ddl;
-use crate::model::{Dialect, Table, Value};
+use crate::model::{ColumnState, Dialect, Table, Value};
 use crate::value::bytes_to_pg_hex;
 
 pub struct PgTarget {
@@ -254,6 +254,25 @@ pub async fn existing_columns(target: &PgTarget, table: &Table) -> Result<Vec<St
         .await
         .with_context(|| format!("读取目标 {} 的列失败", table.name))?;
     Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
+}
+
+/// 目标列的类型与非空状态，供结构漂移比对。
+pub async fn column_states(target: &PgTarget, table: &Table) -> Result<Vec<ColumnState>> {
+    let regclass = Dialect::Postgres.qualified(&target.ns, &table.name);
+    let rows = target
+        .client
+        .query(
+            "SELECT a.attname::text, format_type(a.atttypid, a.atttypmod), a.attnotnull \
+             FROM pg_attribute a \
+             WHERE a.attrelid = $1::text::regclass AND a.attnum > 0 AND NOT a.attisdropped",
+            &[&regclass],
+        )
+        .await
+        .with_context(|| format!("读取目标 {} 的列定义失败", table.name))?;
+    Ok(rows
+        .iter()
+        .map(|r| ColumnState { name: r.get(0), data_type: r.get(1), not_null: r.get(2) })
+        .collect())
 }
 
 /// 目标表已有索引名（含主键），用于只补缺失索引。

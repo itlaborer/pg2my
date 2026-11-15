@@ -1,6 +1,6 @@
 //! 按目标方言生成 DDL 语句。
 
-use crate::model::{Column, ColumnKind, Dialect, Table};
+use crate::model::{Column, ColumnKind, Dialect, ForeignKey, Sequence, Table, View};
 use crate::type_map;
 
 /// 截断标识符，PG 上限 63 字节，MySQL 64 字符，这里统一按 60 字节留余量。
@@ -132,43 +132,44 @@ fn create_enum_sql(qualified: &str, labels: &[String]) -> String {
     )
 }
 
+/// MySQL 单列定义，建表与 MODIFY COLUMN 共用。
+pub fn mysql_column_def(src: Dialect, table: &Table, col: &Column) -> String {
+    let q = Dialect::Mysql;
+    let ty = type_map::mysql_type(&col.kind);
+    let auto_increment = col.auto_increment
+        && mysql_auto_increment_ok(&col.kind)
+        && table.primary_key.len() == 1
+        && table.primary_key[0] == col.name;
+    let mut line = format!("  {} {}", q.quote(&col.name), ty);
+    if auto_increment {
+        line.push_str(" NOT NULL AUTO_INCREMENT");
+    } else {
+        if col.not_null {
+            line.push_str(" NOT NULL");
+        }
+        if let Some(def) = translate_default(src, Dialect::Mysql, &col.kind, col.default.as_deref()) {
+            line.push_str(" DEFAULT ");
+            line.push_str(&def);
+        }
+    }
+    if let Some(comment) = &col.comment {
+        if !comment.is_empty() {
+            line.push_str(&format!(" COMMENT '{}'", type_map::escape_mysql_literal(comment)));
+        }
+    }
+    // 保留 MySQL 的 ON UPDATE CURRENT_TIMESTAMP 语义
+    if col.on_update_timestamp && matches!(col.kind, ColumnKind::Timestamp | ColumnKind::TimestampTz) {
+        line.push_str(" ON UPDATE CURRENT_TIMESTAMP");
+    }
+    line
+}
+
 fn mysql_create(src: Dialect, ns: &str, table: &Table) -> Vec<String> {
     let q = Dialect::Mysql;
     let mut lines = Vec::with_capacity(table.columns.len() + table.indexes.len() + 1);
 
     for col in &table.columns {
-        let ty = type_map::mysql_type(&col.kind);
-        let auto_increment = col.auto_increment
-            && mysql_auto_increment_ok(&col.kind)
-            && table.primary_key.len() == 1
-            && table.primary_key[0] == col.name;
-        let mut line = format!("  {} {}", q.quote(&col.name), ty);
-        if auto_increment {
-            line.push_str(" NOT NULL AUTO_INCREMENT");
-        } else {
-            if col.not_null {
-                line.push_str(" NOT NULL");
-            }
-            if let Some(def) = translate_default(src, Dialect::Mysql, &col.kind, col.default.as_deref()) {
-                line.push_str(" DEFAULT ");
-                line.push_str(&def);
-            }
-        }
-        if let Some(comment) = &col.comment {
-            if !comment.is_empty() {
-                line.push_str(&format!(
-                    " COMMENT '{}'",
-                    type_map::escape_mysql_literal(comment)
-                ));
-            }
-        }
-        // 保留 MySQL 的 ON UPDATE CURRENT_TIMESTAMP 语义
-        if col.on_update_timestamp
-            && matches!(col.kind, ColumnKind::Timestamp | ColumnKind::TimestampTz)
-        {
-            line.push_str(" ON UPDATE CURRENT_TIMESTAMP");
-        }
-        lines.push(line);
+        lines.push(mysql_column_def(src, table, col));
     }
 
     if !table.primary_key.is_empty() {
@@ -344,38 +345,53 @@ fn mysql_fk_name(table: &Table, name: &str) -> String {
 
 /// 外键语句，必须在数据搬完之后执行。
 pub fn foreign_key_statements(target: Dialect, ns: &str, table: &Table) -> Vec<String> {
+    table
+        .foreign_keys
+        .iter()
+        .filter_map(|fk| foreign_key_statement(target, ns, table, fk, false))
+        .collect()
+}
+
+/// 单条外键。`lenient` 时 PG 追加 NOT VALID：只约束新写入的数据，不校验存量行，
+/// 用于存量数据已经不满足约束时先把结构建起来（后续可再 VALIDATE CONSTRAINT）。
+pub fn foreign_key_statement(
+    target: Dialect,
+    ns: &str,
+    table: &Table,
+    fk: &ForeignKey,
+    lenient: bool,
+) -> Option<String> {
     let q = target;
-    let mut out = Vec::new();
-    for fk in &table.foreign_keys {
-        if fk.columns.is_empty() || fk.ref_columns.is_empty() {
-            continue;
-        }
-        let name = match target {
-            Dialect::Postgres => truncate_ident(&fk.name, 60),
-            Dialect::Mysql => mysql_fk_name(table, &fk.name),
-        };
-        let cols = fk.columns.iter().map(|c| q.quote(c)).collect::<Vec<_>>().join(", ");
-        let ref_cols = fk
-            .ref_columns
-            .iter()
-            .map(|c| q.quote(c))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let mut sql = format!(
-            "ALTER TABLE {} ADD CONSTRAINT {} FOREIGN KEY ({cols}) REFERENCES {} ({ref_cols})",
-            q.qualified(ns, &table.name),
-            q.quote(&name),
-            q.qualified(ns, &fk.ref_table)
-        );
-        if let Some(action) = &fk.on_delete {
-            sql.push_str(&format!(" ON DELETE {action}"));
-        }
-        if let Some(action) = &fk.on_update {
-            sql.push_str(&format!(" ON UPDATE {action}"));
-        }
-        out.push(sql);
+    if fk.columns.is_empty() || fk.ref_columns.is_empty() {
+        return None;
     }
-    out
+    let name = match target {
+        Dialect::Postgres => truncate_ident(&fk.name, 60),
+        Dialect::Mysql => mysql_fk_name(table, &fk.name),
+    };
+    let cols = fk.columns.iter().map(|c| q.quote(c)).collect::<Vec<_>>().join(", ");
+    let ref_cols = fk
+        .ref_columns
+        .iter()
+        .map(|c| q.quote(c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut sql = format!(
+        "ALTER TABLE {} ADD CONSTRAINT {} FOREIGN KEY ({cols}) REFERENCES {} ({ref_cols})",
+        q.qualified(ns, &table.name),
+        q.quote(&name),
+        q.qualified(ns, &fk.ref_table)
+    );
+    if let Some(action) = &fk.on_delete {
+        sql.push_str(&format!(" ON DELETE {action}"));
+    }
+    if let Some(action) = &fk.on_update {
+        sql.push_str(&format!(" ON UPDATE {action}"));
+    }
+    if lenient && target == Dialect::Postgres {
+        sql.push_str(" NOT VALID");
+    }
+    Some(sql)
 }
 
 /// 重复迁移时先摘掉目标表上的外键，避免 --truncate 被引用关系挡住。
@@ -466,6 +482,36 @@ pub fn sequence_statements(target: Dialect, ns: &str, table: &Table) -> Vec<Stri
                  (SELECT EXISTS (SELECT 1 FROM {table_sql})))"
             ));
         }
+    }
+    out
+}
+
+/// 视图定义是源方言 SQL，只允许同方言之间直接重建。
+pub fn view_statement(target: Dialect, ns: &str, view: &View) -> String {
+    format!(
+        "CREATE OR REPLACE VIEW {} AS {}",
+        target.qualified(ns, &view.name),
+        view.definition.trim().trim_end_matches(';')
+    )
+}
+
+/// 独立序列：先按源定义建序列，再把位点推到源当前值。
+pub fn standalone_sequence_statements(ns: &str, seq: &Sequence) -> Vec<String> {
+    let q = Dialect::Postgres;
+    let qualified = q.qualified(ns, &seq.name);
+    let mut out = vec![format!(
+        "CREATE SEQUENCE IF NOT EXISTS {qualified} INCREMENT BY {} MINVALUE {} MAXVALUE {} \
+         START WITH {} CACHE {}{}",
+        seq.increment,
+        seq.min_value,
+        seq.max_value,
+        seq.start,
+        seq.cache,
+        if seq.cycle { " CYCLE" } else { " NO CYCLE" }
+    )];
+    if let Some(last) = seq.last_value {
+        let literal = qualified.replace('\'', "''");
+        out.push(format!("SELECT setval('{literal}', {last}, {})", seq.is_called));
     }
     out
 }
@@ -597,6 +643,99 @@ fn strip_pg_cast(expr: &str) -> &str {
         Some(i) => expr[..i].trim_end(),
         None => expr,
     }
+}
+
+/// 结构漂移：把列对齐成源定义。
+/// PG 分开改类型与非空；MySQL 用完整列定义 MODIFY，一次对齐类型、非空、默认值与注释。
+pub fn sync_column_statements(
+    src: Dialect,
+    target: Dialect,
+    ns: &str,
+    table: &Table,
+    col: &Column,
+    type_changed: bool,
+    null_changed: bool,
+) -> Vec<String> {
+    let q = target;
+    let table_sql = q.qualified(ns, &table.name);
+    match target {
+        Dialect::Postgres => {
+            let col_sql = q.quote(&col.name);
+            let mut out = Vec::new();
+            if type_changed {
+                // 枚举/SET 是自定义类型，跨类型转换需要 USING，交人工处理
+                if !matches!(col.kind, ColumnKind::Enum { .. } | ColumnKind::Set { .. }) {
+                    let ty = pg_column_type(ns, &table.name, col);
+                    out.push(format!("ALTER TABLE {table_sql} ALTER COLUMN {col_sql} TYPE {ty}"));
+                }
+            }
+            if null_changed {
+                out.push(format!(
+                    "ALTER TABLE {table_sql} ALTER COLUMN {col_sql} {} NOT NULL",
+                    if col.not_null { "SET" } else { "DROP" }
+                ));
+            }
+            out
+        }
+        Dialect::Mysql => {
+            if !type_changed && !null_changed {
+                return Vec::new();
+            }
+            vec![format!(
+                "ALTER TABLE {table_sql} MODIFY COLUMN {}",
+                mysql_column_def(src, table, col).trim()
+            )]
+        }
+    }
+}
+
+/// 类型文本归一化后再比较，避免 `integer`/`int`、`int(11)` 等同义写法造成误报。
+pub fn same_column_type(expected: &str, actual: &str) -> bool {
+    normalize_type(expected) == normalize_type(actual)
+}
+
+fn normalize_type(s: &str) -> String {
+    let mut t = s.trim().to_ascii_lowercase().replace(['"', '`'], "");
+    // schema 限定只可能出现在括号参数之前
+    let paren = t.find('(').unwrap_or(t.len());
+    if let Some(dot) = t[..paren].rfind('.') {
+        t = t[dot + 1..].to_string();
+    }
+    t.retain(|c| !c.is_whitespace());
+    t = t.replace("withtimezone", "tz").replace("withouttimezone", "");
+    // MySQL 的 BOOLEAN 是 tinyint(1) 的别名
+    if t == "boolean" || t == "bool" {
+        t = "tinyint(1)".to_string();
+    }
+    // 整数显示宽度不参与比较：int(11) == int
+    for prefix in ["tinyint", "smallint", "mediumint", "bigint", "int"] {
+        if let Some(rest) = t.strip_prefix(prefix) {
+            if rest.starts_with('(') {
+                if let Some(end) = rest.find(')') {
+                    if rest[1..end].chars().all(|c| c.is_ascii_digit()) {
+                        t = format!("{prefix}{}", &rest[end + 1..]);
+                    }
+                }
+            }
+            break;
+        }
+    }
+    for (from, to) in [
+        ("charactervarying", "varchar"),
+        ("doubleprecision", "float8"),
+        ("character", "char"),
+        ("integer", "int"),
+        ("int4", "int"),
+        ("int8", "bigint"),
+        ("int2", "smallint"),
+        ("decimal", "numeric"),
+    ] {
+        if let Some(rest) = t.strip_prefix(from) {
+            t = format!("{to}{rest}");
+            break;
+        }
+    }
+    t
 }
 
 #[cfg(test)]
@@ -758,5 +897,60 @@ mod tests {
             translate_default(Dialect::Mysql, Dialect::Postgres, &ColumnKind::Text { max_len: None }, Some("hello")),
             Some("'hello'".to_string())
         );
+    }
+
+    #[test]
+    fn column_type_comparison_ignores_aliases() {
+        assert!(same_column_type("INT", "int(11)"));
+        assert!(same_column_type("BIGINT UNSIGNED", "bigint(20) unsigned"));
+        assert!(same_column_type("BOOLEAN", "tinyint(1)"));
+        assert!(same_column_type("VARCHAR(64)", "character varying(64)"));
+        assert!(same_column_type("TIMESTAMPTZ", "timestamp with time zone"));
+        assert!(same_column_type("TIMESTAMP", "timestamp without time zone"));
+        assert!(same_column_type("DOUBLE PRECISION", "float8"));
+        assert!(same_column_type("DECIMAL(10,2)", "numeric(10, 2)"));
+        assert!(same_column_type("\"public\".\"mood\"", "mood"));
+        assert!(!same_column_type("INT", "bigint"));
+        assert!(!same_column_type("VARCHAR(64)", "varchar(128)"));
+        assert!(!same_column_type("TIMESTAMP", "timestamp with time zone"));
+    }
+
+    #[test]
+    fn sync_column_sql_matches_target_dialect() {
+        let mut table = sample_table();
+        let col = Column {
+            name: "age".to_string(),
+            kind: ColumnKind::Int,
+            not_null: true,
+            default: None,
+            auto_increment: false,
+            on_update_timestamp: false,
+            comment: None,
+        };
+        table.columns.push(col.clone());
+        let pg = sync_column_statements(
+            Dialect::Postgres,
+            Dialect::Postgres,
+            "public",
+            &table,
+            &col,
+            true,
+            true,
+        );
+        assert_eq!(pg.len(), 2);
+        assert!(pg[0].contains("ALTER COLUMN \"age\" TYPE"), "{pg:?}");
+        assert!(pg[1].ends_with("SET NOT NULL"), "{pg:?}");
+
+        let my = sync_column_statements(
+            Dialect::Postgres,
+            Dialect::Mysql,
+            "demo",
+            &table,
+            &col,
+            false,
+            true,
+        );
+        assert_eq!(my.len(), 1);
+        assert!(my[0].contains("MODIFY COLUMN `age` INT NOT NULL"), "{my:?}");
     }
 }
