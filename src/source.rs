@@ -1,10 +1,10 @@
 //! 源端抽象：统一调度 PG / MySQL 的内省与读取。
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 
 use crate::model::{CopyStat, Dialect, Endpoint, IncrementalFilter, RowResume, Table};
 use crate::sink::Sink;
-use crate::{my_source, pg_source};
+use crate::{my_source, pg_direct, pg_source};
 
 pub enum Source {
     Pg(pg_source::PgSource),
@@ -95,6 +95,14 @@ impl Source {
         }
     }
 
+    /// PG → PG 的 COPY 直通：源端字节流直接写入目标，仅用于无过滤、无续搬的整表搬运。
+    pub async fn copy_direct(&self, table: &Table, sink: &mut Sink) -> Result<u64> {
+        match (self, sink) {
+            (Source::Pg(src), Sink::Pg(dst)) => pg_direct::run(src, dst, table).await,
+            _ => bail!("COPY 直通仅支持 PostgreSQL → PostgreSQL"),
+        }
+    }
+
     pub async fn count(&mut self, table: &Table) -> Result<i64> {
         match self {
             Source::Pg(s) => pg_source::count(s, table).await,
@@ -106,6 +114,18 @@ impl Source {
         match self {
             Source::Pg(s) => pg_source::max_text(s, table, column).await,
             Source::My(s) => my_source::max_text(s, table, column).await,
+        }
+    }
+
+    /// 单表分片用：整数主键的 min/max。
+    pub async fn pk_bounds(
+        &mut self,
+        table: &Table,
+        filter: Option<&str>,
+    ) -> Result<Option<(i64, i64)>> {
+        match self {
+            Source::Pg(s) => pg_source::pk_bounds(s, table, filter).await,
+            Source::My(s) => my_source::pk_bounds(s, table, filter).await,
         }
     }
 }

@@ -7,7 +7,8 @@
 - **四种方向**：由 `--source` / `--target` 连接串自动判断，无需额外参数
 - **结构迁移**：表、列、主键、索引、外键、注释、枚举、数组、JSON、生成列、自增/序列
 - **并行搬运**：`--parallel` 按表并行，每个任务独立连接
-- **PG COPY 加速**：`--copy` 走 `COPY FROM STDIN`，比多行 INSERT 快约一个量级
+- **单表分片**：`--shards N` 按整数主键范围把一张大表拆成 N 片并发搬运（PG 源共享同一快照）
+- **PG COPY 加速**：`--copy` 走 `COPY FROM STDIN`，比多行 INSERT 快约一个量级；PG → PG 时直接 `COPY TO STDOUT` → `COPY FROM STDIN` 字节流直通，不做逐行类型转换
 - **一致性快照**：PG 用 `pg_export_snapshot()` + REPEATABLE READ，MySQL 用 `START TRANSACTION WITH CONSISTENT SNAPSHOT`，并行任务共享同一快照
 - **行级断点续搬**：`--resume` 按单列主键做 keyset 分页，中断后从上次主键继续，不重不漏
 - **增量同步**：`--cdc` 支持轮询水位与 MySQL binlog（ROW 格式），可捕获 INSERT/UPDATE/DELETE
@@ -97,8 +98,9 @@ pg2mysql --source postgres://app@10.0.0.1:5432/appdb \
 |---|---|---|
 | `--batch-size` | 每批写入行数 | `1000` |
 | `--parallel` | 并行搬运的表数 | `1` |
+| `--shards` | 单表按整数主键范围拆成 N 片并发搬运，仅对单列整数主键生效 | `1` |
 | `--truncate` | 写入前清空目标表 | 否 |
-| `--copy` | PG 目标使用 COPY 批量装载（upsert 时自动退回 INSERT） | 否 |
+| `--copy` | PG 目标使用 COPY 批量装载（upsert 时自动退回 INSERT；PG → PG 为字节流直通） | 否 |
 | `--verify` | 迁移完成后比对行数 | 否 |
 | `--ddl-only` | 只打印目标方言 DDL | 否 |
 | `--dry-run` | 打印 DDL 与数据搬运计划，不连目标库 | 否 |
@@ -124,6 +126,24 @@ pg2mysql \
 ```
 
 中断后重跑同一条命令即可：已完成表跳过，未完成表从上次主键继续。
+
+### 单张超大表分片并行
+
+```bash
+pg2mysql \
+  --source postgres://app@10.0.0.1:5432/appdb \
+  --target mysql://app@10.0.0.2:3306/appdb \
+  --tables big_events \
+  --shards 8 --copy
+```
+
+`--shards 8` 会先查主键 `min/max`，把 `[min, max]` 均分成最多 8 段闭区间并发搬运，段与段之间不重不漏。要点：
+
+- 只对**单列整数主键**（`smallint` / `int` / `bigint`）生效，其它表自动退回整表搬运
+- 与 `--resume`、upsert 互斥：续搬与增量写入始终走单连接
+- 可与 `--where` 叠加，分片条件会与过滤条件取交集
+- 总连接数约为 `--parallel × --shards × 2`（源 + 目标各一条）
+- PG 源各片共享导出快照，跨片时点一致；**MySQL 源各片独立开一致性事务，跨片时点可能不同**，需要严格一致时不要用分片
 
 ### 只同步部分数据
 

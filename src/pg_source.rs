@@ -358,6 +358,30 @@ fn pg_action(code: &str) -> Option<String> {
 }
 
 /// 统计源表行数。
+/// 单表分片用：取整数主键的最小/最大值（受 where 过滤影响）。
+pub async fn pk_bounds(
+    src: &PgSource,
+    table: &Table,
+    filter: Option<&str>,
+) -> Result<Option<(i64, i64)>> {
+    let q = Dialect::Postgres;
+    let col = q.quote(&table.primary_key[0]);
+    let mut sql = format!(
+        "SELECT min({col})::bigint, max({col})::bigint FROM {}",
+        q.qualified(&src.ns, &table.name)
+    );
+    if let Some(w) = filter {
+        sql.push_str(&format!(" WHERE {w}"));
+    }
+    let row = src.client.query_one(&sql, &[]).await.context("读取主键范围失败")?;
+    let lo: Option<i64> = row.get(0);
+    let hi: Option<i64> = row.get(1);
+    Ok(match (lo, hi) {
+        (Some(a), Some(b)) => Some((a, b)),
+        _ => None,
+    })
+}
+
 pub async fn count(src: &PgSource, table: &Table) -> Result<i64> {
     let sql = format!(
         "SELECT count(*)::bigint FROM {}",

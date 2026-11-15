@@ -2,7 +2,8 @@
 
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, pin_mut};
-use tokio_postgres::{Client, NoTls};
+use std::collections::HashMap;
+use tokio_postgres::{Client, NoTls, Statement};
 
 use crate::ddl;
 use crate::model::{Dialect, Table, Value};
@@ -11,6 +12,8 @@ use crate::value::bytes_to_pg_hex;
 pub struct PgTarget {
     pub client: Client,
     pub ns: String,
+    /// 按 SQL 文本缓存预处理语句：同一张表每批 SQL 只有“满批/尾批”两种形态
+    stmts: HashMap<String, Statement>,
 }
 
 pub async fn connect(url: &str, ns: &str) -> Result<PgTarget> {
@@ -34,7 +37,7 @@ pub async fn connect(url: &str, ns: &str) -> Result<PgTarget> {
             Dialect::Postgres.quote(ns)
         ))
         .await;
-    Ok(PgTarget { client, ns: ns.to_string() })
+    Ok(PgTarget { client, ns: ns.to_string(), stmts: HashMap::new() })
 }
 
 /// 执行一条（可含多个语句的）SQL。
@@ -136,7 +139,7 @@ fn copy_escape_text(out: &mut Vec<u8>, s: &str) {
 
 /// 批量写入，参数统一以文本传输再转成目标列类型。
 pub async fn write_batch(
-    target: &PgTarget,
+    target: &mut PgTarget,
     table: &Table,
     rows: &[Vec<Value>],
     upsert: bool,
@@ -155,7 +158,7 @@ pub async fn write_batch(
 }
 
 async fn write_chunk(
-    target: &PgTarget,
+    target: &mut PgTarget,
     table: &Table,
     rows: &[Vec<Value>],
     upsert: bool,
@@ -220,9 +223,19 @@ async fn write_chunk(
         .iter()
         .map(|p| p as &(dyn tokio_postgres::types::ToSql + Sync))
         .collect();
+    // 同一张表每批 SQL 只有“满批/尾批”两种形态，预处理后复用
+    if !target.stmts.contains_key(&sql) {
+        let stmt = target
+            .client
+            .prepare(&sql)
+            .await
+            .with_context(|| format!("预处理写入 SQL 失败: {}", table.name))?;
+        target.stmts.insert(sql.clone(), stmt);
+    }
+    let stmt = target.stmts.get(&sql).expect("刚插入的预处理语句");
     target
         .client
-        .execute(sql.as_str(), &refs)
+        .execute(stmt, &refs)
         .await
         .with_context(|| format!("写入 PostgreSQL 表 {} 失败", table.name))?;
     Ok(rows.len() as u64)

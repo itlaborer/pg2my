@@ -274,6 +274,32 @@ fn action(rule: &str) -> Option<String> {
     }
 }
 
+/// 单表分片用：取整数主键的最小/最大值（受 where 过滤影响）。
+pub async fn pk_bounds(
+    src: &mut MySource,
+    table: &Table,
+    filter: Option<&str>,
+) -> Result<Option<(i64, i64)>> {
+    let q = Dialect::Mysql;
+    let col = q.quote(&table.primary_key[0]);
+    let mut sql = format!(
+        "SELECT MIN({col}), MAX({col}) FROM {}",
+        q.qualified(&src.ns, &table.name)
+    );
+    if let Some(w) = filter {
+        sql.push_str(&format!(" WHERE {w}"));
+    }
+    let row: Option<mysql_async::Row> =
+        src.conn.query_first(sql).await.context("读取主键范围失败")?;
+    let Some(row) = row else { return Ok(None) };
+    let lo: Option<i64> = row.get(0);
+    let hi: Option<i64> = row.get(1);
+    Ok(match (lo, hi) {
+        (Some(a), Some(b)) => Some((a, b)),
+        _ => None,
+    })
+}
+
 pub async fn count(src: &mut MySource, table: &Table) -> Result<i64> {
     let sql = format!(
         "SELECT count(*) FROM {}",

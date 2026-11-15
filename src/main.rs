@@ -10,6 +10,7 @@ mod ddl;
 mod model;
 mod my_source;
 mod my_target;
+mod pg_direct;
 mod pg_source;
 mod pg_target;
 mod sink;
@@ -27,7 +28,9 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use crate::checkpoint::Checkpoint;
-use crate::model::{Dialect, Endpoint, RowResume, Table, apply_env_password};
+use crate::model::{
+    ColumnKind, CopyStat, Dialect, Endpoint, RowResume, Table, apply_env_password,
+};
 use crate::sink::Sink;
 use crate::source::Source;
 
@@ -69,6 +72,10 @@ struct Cli {
     /// 并行搬运的表数，每个任务独立建连接
     #[arg(long, default_value_t = 1)]
     parallel: usize,
+
+    /// 单表按整数主键范围拆成 N 片并发搬运（总连接数约为 parallel×shards×2）
+    #[arg(long, default_value_t = 1)]
+    shards: usize,
 
     /// 写入前清空目标表
     #[arg(long)]
@@ -202,6 +209,9 @@ async fn main() -> Result<()> {
         );
         eprintln!("        需要严格一致请用 --parallel 1，或改用 --cdc --cdc-mode binlog 在全量后追平。");
     }
+    if src_dialect == Dialect::Mysql && cli.shards > 1 {
+        eprintln!("  警告：MySQL 源按主键分片时，各片各自开启一致性快照，跨片时点可能不同。");
+    }
 
     if cli.dry_run {
         print_ddl(src_dialect, dst_dialect, &dst_ns, &tables);
@@ -210,6 +220,9 @@ async fn main() -> Result<()> {
             let mut line = format!("--   {}", table.name);
             if let Some(w) = &cli.where_clause {
                 line.push_str(&format!("  [WHERE {w}]"));
+            }
+            if cli.shards > 1 && shard_column(table).is_some() {
+                line.push_str(&format!("  [主键分片 {}]", cli.shards));
             }
             println!("{line}");
         }
@@ -351,6 +364,7 @@ async fn main() -> Result<()> {
         let src_ep = src_ep.clone();
         let dst_ep = dst_ep.clone();
         let batch_size = cli.batch_size;
+        let shards = cli.shards;
         let truncate = cli.truncate;
         let snapshot = snapshot.clone();
         let where_clause = cli.where_clause.clone();
@@ -367,20 +381,77 @@ async fn main() -> Result<()> {
                 if truncate {
                     sink.truncate(&table).await?;
                 }
+                // 单表分片：整数单列主键、非续搬、非 upsert 时按主键范围拆成多个并发任务
+                if shards > 1 && !upsert && resume.is_none() {
+                    if let Some(pk) = shard_column(&table) {
+                        let conds = shard_conditions(
+                            &mut src,
+                            src_ep.dialect,
+                            &table,
+                            pk,
+                            shards,
+                            where_clause.as_deref(),
+                        )
+                        .await?;
+                        if !conds.is_empty() {
+                            // 先释放外层连接，避免与各分片连接叠加
+                            drop(sink);
+                            let mut futs = Vec::with_capacity(conds.len());
+                            for cond in conds {
+                                let src_ep = src_ep.clone();
+                                let dst_ep = dst_ep.clone();
+                                let snapshot = snapshot.clone();
+                                let table = table.clone();
+                                futs.push(async move {
+                                    let mut s =
+                                        Source::connect_snapshot(&src_ep, snapshot.as_deref()).await?;
+                                    let mut k = Sink::connect(&dst_ep).await?;
+                                    s.copy(
+                                        &table,
+                                        dst_ep.dialect,
+                                        batch_size,
+                                        None,
+                                        &mut k,
+                                        false,
+                                        None,
+                                        copy_mode,
+                                        None,
+                                        Some(&cond),
+                                    )
+                                    .await
+                                });
+                            }
+                            let stats = futures_util::future::try_join_all(futs).await?;
+                            let rows = stats.iter().map(|s| s.rows).sum();
+                            return Ok(CopyStat { rows, last_key: None });
+                        }
+                    }
+                }
                 let copy = copy_mode;
-                src.copy(
-                    &table,
-                    dst_ep.dialect,
-                    batch_size,
-                    None,
-                    &mut sink,
-                    upsert,
-                    None,
-                    copy,
-                    resume.as_ref(),
-                    where_clause.as_deref(),
-                )
-                .await
+                // pg→pg 且无过滤/续搬时，COPY 字节流直通，省掉逐行文本转换
+                let direct = copy
+                    && src_ep.dialect == Dialect::Postgres
+                    && dst_ep.dialect == Dialect::Postgres
+                    && !upsert
+                    && where_clause.is_none();
+                if direct {
+                    let rows = src.copy_direct(&table, &mut sink).await?;
+                    Ok(CopyStat { rows, last_key: None })
+                } else {
+                    src.copy(
+                        &table,
+                        dst_ep.dialect,
+                        batch_size,
+                        None,
+                        &mut sink,
+                        upsert,
+                        None,
+                        copy,
+                        resume.as_ref(),
+                        where_clause.as_deref(),
+                    )
+                    .await
+                }
             }
             .await;
             (table.name, result, t0.elapsed().as_secs_f64())
@@ -549,4 +620,46 @@ fn mysql_db(url: &str) -> Result<String> {
     opts.db_name()
         .map(|s| s.to_string())
         .ok_or_else(|| anyhow::anyhow!("MySQL 源连接串里没有库名，请用 --schema 指定"))
+}
+
+/// 只有“单列、整数”主键才能按范围无重叠地切分。
+fn shard_column(table: &Table) -> Option<&str> {
+    if table.primary_key.len() != 1 {
+        return None;
+    }
+    let name = table.primary_key[0].as_str();
+    let col = table.columns.iter().find(|c| c.name == name)?;
+    matches!(col.kind, ColumnKind::SmallInt | ColumnKind::Int | ColumnKind::BigInt)
+        .then_some(name)
+}
+
+/// 把整数主键区间均分成 n 段，返回每段可直接追加到源查询的过滤条件。
+async fn shard_conditions(
+    src: &mut Source,
+    dialect: Dialect,
+    table: &Table,
+    pk: &str,
+    shards: usize,
+    extra: Option<&str>,
+) -> Result<Vec<String>> {
+    let Some((min, max)) = src.pk_bounds(table, extra).await? else {
+        // 空表（或全被 where 过滤）：退回单任务搬运
+        return Ok(Vec::new());
+    };
+    // 用 i128 防溢出：i64 全区间做减法会越界
+    let span = max as i128 - min as i128 + 1;
+    let n = (shards as i128).min(span).max(1);
+    let chunk = (span + n - 1) / n;
+    let q = dialect.quote(pk);
+    let mut out = Vec::new();
+    let mut lo = min as i128;
+    while lo <= max as i128 {
+        let hi = (lo + chunk - 1).min(max as i128);
+        out.push(match extra {
+            Some(w) => format!("({w}) AND {q} >= {lo} AND {q} <= {hi}"),
+            None => format!("{q} >= {lo} AND {q} <= {hi}"),
+        });
+        lo = hi + 1;
+    }
+    Ok(out)
 }

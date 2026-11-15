@@ -2,8 +2,9 @@
 
 use anyhow::{Context, Result};
 use mysql_async::{
-    Conn, Opts, OptsBuilder, Params, Value as MyValue, prelude::Queryable,
+    Conn, Opts, OptsBuilder, Params, Statement, Value as MyValue, prelude::Queryable,
 };
+use std::collections::HashMap;
 
 use crate::model::{Dialect, Table, Value};
 
@@ -12,6 +13,8 @@ pub struct MyTarget {
     pub db: String,
     /// MySQL 8.0.19+ 支持 `AS new` 别名；MariaDB 与 5.7 仍只支持 VALUES()
     upsert_alias: bool,
+    /// 按 SQL 文本缓存预处理语句，避免每批重新 parse
+    stmts: HashMap<String, Statement>,
 }
 
 pub async fn connect(url: &str, db: &str) -> Result<MyTarget> {
@@ -39,7 +42,12 @@ pub async fn connect(url: &str, db: &str) -> Result<MyTarget> {
         .await
         .context("读取 MySQL 版本失败")?;
     let upsert_alias = supports_upsert_alias(version.as_deref().unwrap_or(""));
-    Ok(MyTarget { conn, db: db.to_string(), upsert_alias })
+    Ok(MyTarget {
+        conn,
+        db: db.to_string(),
+        upsert_alias,
+        stmts: HashMap::new(),
+    })
 }
 
 /// `INSERT ... AS new ON DUPLICATE KEY UPDATE` 从 MySQL 8.0.19 开始支持，
@@ -188,8 +196,19 @@ async fn write_chunk(
         }
     }
 
-    target.conn
-        .exec_drop(sql, Params::Positional(params))
+    // 同一张表每批只有“满批/尾批”两种 SQL 形态，预处理一次即可复用
+    if !target.stmts.contains_key(&sql) {
+        let stmt = target
+            .conn
+            .prep(sql.as_str())
+            .await
+            .with_context(|| format!("预处理写入 SQL 失败: {}", table.name))?;
+        target.stmts.insert(sql.clone(), stmt);
+    }
+    let stmt = target.stmts.get(&sql).expect("刚插入的预处理语句");
+    target
+        .conn
+        .exec_drop(stmt, Params::Positional(params))
         .await
         .with_context(|| format!("写入 MySQL 表 {} 失败", table.name))?;
     Ok(rows.len() as u64)
